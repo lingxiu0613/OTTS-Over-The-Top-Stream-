@@ -1,0 +1,1040 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>OTTS Debug Panel</title>
+    <style>
+      :root {
+        --bg: #0b1220;
+        --panel: rgba(15, 23, 42, 0.92);
+        --line: #243041;
+        --text: #e5e7eb;
+        --muted: #94a3b8;
+        --ok: #22c55e;
+        --warn: #f59e0b;
+        --bad: #f87171;
+      }
+
+      body {
+        margin: 0;
+        font-family: "Segoe UI", sans-serif;
+        color: var(--text);
+        background:
+          radial-gradient(circle at top left, rgba(249, 115, 22, 0.18), transparent 28%),
+          radial-gradient(circle at top right, rgba(34, 197, 94, 0.12), transparent 24%),
+          linear-gradient(180deg, #111827 0%, var(--bg) 60%);
+      }
+
+      main {
+        max-width: 1280px;
+        margin: 0 auto;
+        padding: 28px 18px 56px;
+      }
+
+      .hero,
+      .card {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 18px;
+        padding: 18px;
+        margin-bottom: 16px;
+        box-shadow: 0 18px 40px rgba(0, 0, 0, 0.25);
+      }
+
+      .hero h1,
+      .card h2 {
+        margin-top: 0;
+      }
+
+      .muted {
+        color: var(--muted);
+      }
+
+      .warn {
+        color: var(--bad);
+      }
+
+      .stats,
+      .two-col {
+        display: grid;
+        gap: 12px;
+      }
+
+      .stats {
+        grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      }
+
+      .two-col {
+        grid-template-columns: 1.5fr 1fr;
+      }
+
+      .stat {
+        background: rgba(2, 6, 23, 0.5);
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        padding: 14px;
+      }
+
+      .stat strong {
+        display: block;
+        margin-top: 6px;
+        font-size: 24px;
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+      }
+
+      th,
+      td {
+        text-align: left;
+        vertical-align: top;
+        padding: 10px 8px;
+        border-bottom: 1px solid var(--line);
+      }
+
+      th {
+        color: var(--muted);
+        font-weight: 600;
+      }
+
+      button {
+        border: 0;
+        border-radius: 10px;
+        padding: 8px 12px;
+        background: #ea580c;
+        color: white;
+        cursor: pointer;
+        margin-right: 6px;
+        margin-bottom: 6px;
+      }
+
+      button.secondary {
+        background: #334155;
+      }
+
+      button.good {
+        background: #15803d;
+      }
+
+      button:disabled {
+        opacity: 0.55;
+        cursor: not-allowed;
+      }
+
+      input,
+      pre {
+        width: 100%;
+        box-sizing: border-box;
+        border-radius: 12px;
+        border: 1px solid var(--line);
+        background: #09101d;
+        color: var(--text);
+      }
+
+      input {
+        padding: 10px 12px;
+      }
+
+      pre {
+        margin: 0;
+        padding: 12px;
+        overflow: auto;
+        white-space: pre-wrap;
+        word-break: break-word;
+        min-height: 180px;
+      }
+
+      video {
+        width: 100%;
+        max-height: 400px;
+        border-radius: 14px;
+        background: #000;
+      }
+
+      .pill {
+        display: inline-block;
+        border-radius: 999px;
+        padding: 4px 10px;
+        font-size: 12px;
+        background: rgba(34, 197, 94, 0.16);
+        color: #bbf7d0;
+      }
+
+      .pill.warn {
+        background: rgba(245, 158, 11, 0.16);
+        color: #fde68a;
+      }
+
+      .pill.bad {
+        background: rgba(248, 113, 113, 0.16);
+        color: #fecaca;
+      }
+
+      code {
+        color: #fdba74;
+      }
+
+      @media (max-width: 960px) {
+        .two-col {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div class="hero">
+        <h1>OTTS Debug Panel</h1>
+        <p class="muted">OTTS: Over-The-Top Stream. Current focus as of August 13, 2026: stable RTMP/HTTP-FLV/HLS plus the first WHIP/WHEP session scaffold.</p>
+        <p><a href="/webrtc.html" style="color:#fdba74;">Open WHIP/WHEP browser test page</a></p>
+      </div>
+
+      <div class="card">
+        <h2>Health</h2>
+        <div class="stats">
+          <div class="stat"><div class="muted">RTMP Listen</div><strong id="rtmpListen">-</strong></div>
+          <div class="stat"><div class="muted">HTTP API</div><strong id="httpApiPort">-</strong></div>
+          <div class="stat"><div class="muted">Active Streams</div><strong id="streamCount">-</strong></div>
+          <div class="stat"><div class="muted">Total Viewers</div><strong id="totalViewers">-</strong></div>
+          <div class="stat"><div class="muted">Publishers Online</div><strong id="publishersOnline">-</strong></div>
+          <div class="stat"><div class="muted">Stream Sources</div><strong id="streamSources">-</strong></div>
+          <div class="stat"><div class="muted">Ingest Origins</div><strong id="streamOrigins">-</strong></div>
+          <div class="stat"><div class="muted">Managers</div><strong id="streamManagers">-</strong></div>
+          <div class="stat"><div class="muted">Control API Base</div><strong id="apiBase">-</strong></div>
+          <div class="stat"><div class="muted">HLS Root</div><strong id="hlsRoot">-</strong></div>
+          <div class="stat"><div class="muted">WebRTC Gateway</div><strong id="webrtcGateway">-</strong></div>
+          <div class="stat"><div class="muted">Managed Services</div><strong id="managedProcesses">-</strong></div>
+          <div class="stat"><div class="muted">RTSP Native Publish</div><strong id="rtspNativePublish">-</strong></div>
+          <div class="stat"><div class="muted">RTSP Native Recording</div><strong id="rtspNativeRecording">-</strong></div>
+          <div class="stat"><div class="muted">RTSP Compat Desired</div><strong id="rtspCompatDesired">-</strong></div>
+          <div class="stat"><div class="muted">SRT Sessions</div><strong id="srtSessions">-</strong></div>
+          <div class="stat"><div class="muted">SRT Publish/Play</div><strong id="srtPublishPlay">-</strong></div>
+          <div class="stat"><div class="muted">SRT Running</div><strong id="srtRunning">-</strong></div>
+        </div>
+        <p id="healthSummary" class="muted">Loading...</p>
+      </div>
+
+      <div class="card">
+        <h2>Runtime Services</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Status</th>
+              <th>PID</th>
+              <th>Started</th>
+              <th>Paths</th>
+            </tr>
+          </thead>
+          <tbody id="runtimeTable">
+            <tr><td colspan="5" class="muted">Loading...</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="card">
+        <h2>Core Protocol Sessions</h2>
+        <p class="muted">These records come from the C++ core API and now hold SRT and RTSP compatibility session state in one place.</p>
+        <table>
+          <thead>
+            <tr>
+              <th>Session</th>
+              <th>Protocol</th>
+              <th>State</th>
+              <th>Public / Bind</th>
+              <th>Target</th>
+              <th>Worker</th>
+            </tr>
+          </thead>
+          <tbody id="protocolSessionsTable">
+            <tr><td colspan="6" class="muted">No protocol sessions yet.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="card">
+        <h2>Streams</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Stream</th>
+              <th>Status</th>
+              <th>Viewers</th>
+              <th>Cache</th>
+              <th>Media</th>
+              <th>Playback URLs</th>
+              <th>HLS</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="streamsTable">
+            <tr><td colspan="8" class="muted">Loading...</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="card">
+        <h2>WHIP/WHEP Sessions</h2>
+        <p class="muted">The Python gateway on port 8081 handles the current WHIP/WHEP media transport. Publish first, then subscribe with the same stream key.</p>
+        <table>
+          <thead>
+            <tr>
+              <th>Session</th>
+              <th>Protocol</th>
+              <th>Stream</th>
+              <th>State</th>
+              <th>Error</th>
+              <th>Updated</th>
+            </tr>
+          </thead>
+          <tbody id="webrtcTable">
+            <tr><td colspan="6" class="muted">No WHIP/WHEP sessions yet.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="card">
+        <h2>RTSP Ingest</h2>
+        <p class="muted">Legacy helper path. This ffmpeg RTSP pull relay still exists for camera pull experiments, but OTTS is now prioritizing native RTSP publish/play on `:8554/:8556` below.</p>
+        <p><input id="rtspSourceUrl" placeholder="rtsp://user:pass@camera.example/live" /></p>
+        <p><input id="rtspStreamKey" value="live/rtsp-demo" /></p>
+        <p>
+          <button id="rtspStartBtn">Start RTSP Relay</button>
+          <button id="rtspStopBtn" class="secondary">Stop RTSP Relay</button>
+        </p>
+        <table>
+          <thead>
+            <tr>
+              <th>Stream</th>
+              <th>Status</th>
+              <th>Source</th>
+              <th>Target</th>
+              <th>PID</th>
+            </tr>
+          </thead>
+          <tbody id="rtspTable">
+            <tr><td colspan="5" class="muted">No RTSP relays yet.</td></tr>
+          </tbody>
+        </table>
+        <pre id="rtspLog">No RTSP relay log selected.</pre>
+      </div>
+
+      <div class="card">
+        <h2>SRT Ingest/Egress</h2>
+        <p class="muted">Phase-2 SRT path uses Node-managed ffmpeg workers with libsrt. Publish into OTTS through the SRT listener, then play back through the SRT output listener backed by the RTMP core.</p>
+        <p><input id="srtStreamKey" value="live/srt-demo" /></p>
+        <p>
+          <button id="srtStartBtn">Start SRT Publish+Play</button>
+          <button id="srtStartPublishBtn" class="secondary">Start Publish Only</button>
+          <button id="srtStartPlayBtn" class="secondary">Start Play Only</button>
+          <button id="srtStopBtn" class="secondary">Stop Both</button>
+        </p>
+        <table>
+          <thead>
+            <tr>
+              <th>Stream</th>
+              <th>Publish URL</th>
+              <th>Play URL</th>
+              <th>Publish</th>
+              <th>Play</th>
+              <th>Health</th>
+            </tr>
+          </thead>
+          <tbody id="srtTable">
+            <tr><td colspan="6" class="muted">No SRT sessions yet.</td></tr>
+          </tbody>
+        </table>
+        <pre id="srtLog">No SRT log selected.</pre>
+      </div>
+
+      <div class="card">
+        <h2>RTSP Compatibility</h2>
+        <p class="muted">OTTS now exposes native RTSP publish/play endpoints managed by the Node control plane and backed by the C++ RTMP core. Use this area to inspect desired compat routes and active native publish sessions.</p>
+        <p><input id="rtspCompatStreamKey" value="live/rtsp-compat" /></p>
+        <p>
+          <button id="rtspCompatStartBtn">Start RTSP Publish+Play</button>
+          <button id="rtspCompatStartPublishBtn" class="secondary">Start Publish Only</button>
+          <button id="rtspCompatStartPlayBtn" class="secondary">Start Play Only</button>
+          <button id="rtspCompatStopBtn" class="secondary">Stop Both</button>
+        </p>
+        <table>
+          <thead>
+            <tr>
+              <th>Stream</th>
+              <th>Publish URL</th>
+              <th>Play URL</th>
+              <th>Publish</th>
+              <th>Play</th>
+              <th>Native Session</th>
+            </tr>
+          </thead>
+          <tbody id="rtspCompatTable">
+            <tr><td colspan="6" class="muted">No RTSP compatibility sessions yet.</td></tr>
+          </tbody>
+        </table>
+        <pre id="rtspCompatLog">No RTSP compatibility log selected.</pre>
+      </div>
+
+      <div class="two-col">
+        <div class="card">
+          <h2>Browser Player</h2>
+          <p class="muted">Browser playback currently uses HTTP-FLV. RTMP is for ffplay/PotPlayer. HLS URLs are generated for external HLS-capable players.</p>
+          <p><input id="playUrl" value="http://127.0.0.1:8080/live/demo.flv" /></p>
+          <p>
+            <button id="playBtn">Play</button>
+            <button id="stopBtn" class="secondary">Stop</button>
+          </p>
+          <video id="video" controls muted autoplay playsinline></video>
+          <p id="playerStatus" class="muted">Idle</p>
+        </div>
+
+        <div class="card">
+          <h2>Selected Stream</h2>
+          <p id="selectedStream" class="muted">Click a stream row to inspect details.</p>
+          <pre id="selectedStreamJson">No stream selected.</pre>
+        </div>
+      </div>
+
+      <div class="two-col">
+        <div class="card">
+          <h2>HLS Log</h2>
+          <pre id="hlsLog">No stream selected.</pre>
+        </div>
+
+        <div class="card">
+          <h2>OTTS Runtime Log</h2>
+          <pre id="runtimeLog">Loading...</pre>
+        </div>
+      </div>
+    </main>
+
+    <script src="https://cdn.jsdelivr.net/npm/flv.js@1.6.2/dist/flv.min.js"></script>
+    <script>
+      let currentPlayer = null;
+      let currentState = { streams: [] };
+      let currentWebrtc = { sessions: [], published_streams: [] };
+      let currentRuntime = { managed_processes: [] };
+      let currentRtsp = { proxies: [] };
+      let currentRtspCompat = { sessions: [], publish_sessions: [], merged_sessions: [], summary: {} };
+      let currentSrt = { sessions: [], summary: {} };
+      let currentProtocolSessions = { sessions: [] };
+      let selectedStreamKey = "";
+
+      function hostName() {
+        return window.location.hostname || "127.0.0.1";
+      }
+
+      function buildUrls(streamKey) {
+        const host = hostName();
+        return {
+          rtmp: `rtmp://${host}:1935/${streamKey}`,
+          flv: `http://${host}:8080/${streamKey}.flv`,
+          hls: `http://${host}:3000/hls/${streamKey.split("/").map(encodeURIComponent).join("/")}/index.m3u8`,
+          hlsMaster: `http://${host}:3000/hls/${streamKey.split("/").map(encodeURIComponent).join("/")}/master.m3u8`
+        };
+      }
+
+      function formatEpochMs(value) {
+        if (!value) {
+          return "-";
+        }
+        return new Date(value).toLocaleString();
+      }
+
+      function formatBitrate(bytes, firstAt, lastAt) {
+        if (!bytes || !firstAt || !lastAt || lastAt <= firstAt) {
+          return "-";
+        }
+        const seconds = (lastAt - firstAt) / 1000;
+        if (seconds <= 0) {
+          return "-";
+        }
+        return `${((bytes * 8) / seconds / 1000).toFixed(1)} kbps`;
+      }
+
+      function formatDurationFrom(startedAt, stoppedAt = null) {
+        if (!startedAt) {
+          return "-";
+        }
+        const start = new Date(startedAt).getTime();
+        const end = stoppedAt ? new Date(stoppedAt).getTime() : Date.now();
+        if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) {
+          return "-";
+        }
+        const totalSeconds = Math.floor((end - start) / 1000);
+        const hours = Math.floor(totalSeconds / 3600);
+        const minutes = Math.floor((totalSeconds % 3600) / 60);
+        const seconds = totalSeconds % 60;
+        return hours > 0
+          ? `${hours}h ${minutes}m ${seconds}s`
+          : `${minutes}m ${seconds}s`;
+      }
+
+      function renderWorkerState(worker, desired, idleLabel = "idle") {
+        if (!worker) {
+          return `<span class="muted">${idleLabel}</span>`;
+        }
+        const stateBadge = worker.running
+          ? '<span class="pill">running</span>'
+          : (desired ? '<span class="pill warn">recovering</span>' : '<span class="pill bad">stopped</span>');
+        const details = [
+          `pid:${worker.pid ?? "-"}`,
+          `uptime:${formatDurationFrom(worker.started_at, worker.last_stopped_at)}`,
+          `exit:${worker.last_exit_code ?? "-"}`,
+          `restart:${worker.restart_count ?? 0}`
+        ];
+        if (worker.last_error) {
+          details.push(`err:${worker.last_error}`);
+        }
+        return `${stateBadge}<br/>${details.join("<br/>")}`;
+      }
+
+      function stopPlayer() {
+        if (!currentPlayer) {
+          return;
+        }
+        currentPlayer.pause();
+        currentPlayer.unload();
+        currentPlayer.detachMediaElement();
+        currentPlayer.destroy();
+        currentPlayer = null;
+        document.getElementById("playerStatus").textContent = "Stopped";
+      }
+
+      function playCurrentUrl() {
+        const url = document.getElementById("playUrl").value.trim();
+        const video = document.getElementById("video");
+        stopPlayer();
+
+        if (url.startsWith("rtmp://")) {
+          document.getElementById("playerStatus").textContent =
+            "Browser player only supports HTTP-FLV right now. Use RTMP in ffplay or PotPlayer.";
+          return;
+        }
+
+        if (url.endsWith(".m3u8")) {
+          document.getElementById("playerStatus").textContent =
+            "HLS URL prepared. Open it in an HLS-capable player, or add hls.js later.";
+          return;
+        }
+
+        if (!window.flvjs || !flvjs.isSupported()) {
+          document.getElementById("playerStatus").textContent = "flv.js is not supported in this browser.";
+          return;
+        }
+
+        currentPlayer = flvjs.createPlayer({ type: "flv", isLive: true, url });
+        currentPlayer.attachMediaElement(video);
+        currentPlayer.load();
+        currentPlayer.play();
+        document.getElementById("playerStatus").textContent = `Playing ${url}`;
+      }
+
+      function selectStream(streamKey) {
+        selectedStreamKey = streamKey;
+        renderSelectedStream();
+        refreshHlsLog();
+      }
+
+      async function callJson(url, options) {
+        const response = await fetch(url, options);
+        return response.json();
+      }
+
+      async function refreshHlsLog() {
+        if (!selectedStreamKey) {
+          document.getElementById("hlsLog").textContent = "No stream selected.";
+          return;
+        }
+        try {
+          const data = await callJson(`/api/streams/hls/log?stream_key=${encodeURIComponent(selectedStreamKey)}`);
+          document.getElementById("hlsLog").textContent = (data.lines || []).join("\n") || "No HLS log yet.";
+        } catch (error) {
+          document.getElementById("hlsLog").textContent = `Failed to load HLS log: ${error.message}`;
+        }
+      }
+
+      async function refreshRuntimeLog() {
+        try {
+          const data = await callJson("/api/debug/runtime-log");
+          document.getElementById("runtimeLog").textContent = (data.lines || []).join("\n") || "No runtime log yet.";
+        } catch (error) {
+          document.getElementById("runtimeLog").textContent = `Failed to load runtime log: ${error.message}`;
+        }
+      }
+
+      async function refreshRtspLog(streamKey) {
+        if (!streamKey) {
+          document.getElementById("rtspLog").textContent = "No RTSP relay log selected.";
+          return;
+        }
+        try {
+          const data = await callJson(`/api/rtsp/proxies/log?stream_key=${encodeURIComponent(streamKey)}`);
+          document.getElementById("rtspLog").textContent = (data.lines || []).join("\n") || "No RTSP relay log yet.";
+        } catch (error) {
+          document.getElementById("rtspLog").textContent = `Failed to load RTSP relay log: ${error.message}`;
+        }
+      }
+
+      async function refreshRtspCompatLog(streamKey, mode = "publish") {
+        if (!streamKey) {
+          document.getElementById("rtspCompatLog").textContent = "No RTSP compatibility log selected.";
+          return;
+        }
+        try {
+          const data = await callJson(`/api/rtsp/compat/log?stream_key=${encodeURIComponent(streamKey)}&mode=${encodeURIComponent(mode)}`);
+          document.getElementById("rtspCompatLog").textContent = (data.lines || []).join("\n") || "No RTSP compatibility log yet.";
+        } catch (error) {
+          document.getElementById("rtspCompatLog").textContent = `Failed to load RTSP compatibility log: ${error.message}`;
+        }
+      }
+
+      async function refreshSrtLog(streamKey, mode = "publish") {
+        if (!streamKey) {
+          document.getElementById("srtLog").textContent = "No SRT log selected.";
+          return;
+        }
+        try {
+          const data = await callJson(`/api/srt/log?stream_key=${encodeURIComponent(streamKey)}&mode=${encodeURIComponent(mode)}`);
+          document.getElementById("srtLog").textContent = (data.lines || []).join("\n") || "No SRT log yet.";
+        } catch (error) {
+          document.getElementById("srtLog").textContent = `Failed to load SRT log: ${error.message}`;
+        }
+      }
+
+      function renderSelectedStream() {
+        const target = currentState.streams.find((stream) => stream.stream_key === selectedStreamKey);
+        if (!target) {
+          document.getElementById("selectedStream").textContent = "Click a stream row to inspect details.";
+          document.getElementById("selectedStreamJson").textContent = "No stream selected.";
+          return;
+        }
+        document.getElementById("selectedStream").textContent = `Selected: ${target.stream_key}`;
+        document.getElementById("selectedStreamJson").textContent = JSON.stringify(target, null, 2);
+      }
+
+      function renderWebrtcSessions(sessions) {
+        const tbody = document.getElementById("webrtcTable");
+        if (!sessions.length) {
+          tbody.innerHTML = '<tr><td colspan="6" class="muted">No WHIP/WHEP sessions yet.</td></tr>';
+          return;
+        }
+
+        tbody.innerHTML = sessions.map((session) => `
+          <tr>
+            <td><code>${session.session_id}</code></td>
+            <td>${session.direction}</td>
+            <td>${session.stream_key}</td>
+            <td>${session.state}</td>
+            <td>${session.last_error || "-"}</td>
+            <td>${formatEpochMs(session.updated_at_epoch_ms)}</td>
+          </tr>
+        `).join("");
+      }
+
+      function buildWebrtcStreamMap(webrtcState) {
+        const map = new Map();
+        for (const item of (webrtcState?.streams || [])) {
+          map.set(item.stream_key, item);
+        }
+        return map;
+      }
+
+      function renderRuntimeProcesses(systemStatus) {
+        const tbody = document.getElementById("runtimeTable");
+        const processes = systemStatus?.managed_processes || [];
+        if (!processes.length) {
+          tbody.innerHTML = '<tr><td colspan="5" class="muted">No managed process status available.</td></tr>';
+          return;
+        }
+
+        tbody.innerHTML = processes.map((process) => `
+          <tr>
+            <td><strong>${process.name || "-"}</strong></td>
+            <td>${process.running ? '<span class="pill">running</span>' : '<span class="pill bad">stopped</span>'}</td>
+            <td>${process.pid ?? "-"}</td>
+            <td>${formatEpochMs(process.started_at_epoch_ms)}</td>
+            <td><code>${process.workdir || "-"}</code><br/><code>${process.stdout_path || "-"}</code><br/><code>${process.stderr_path || "-"}</code></td>
+          </tr>
+          `).join("");
+        }
+
+      function renderProtocolSessions(sessions) {
+        const tbody = document.getElementById("protocolSessionsTable");
+        if (!sessions.length) {
+          tbody.innerHTML = '<tr><td colspan="6" class="muted">No protocol sessions yet.</td></tr>';
+          return;
+        }
+
+        tbody.innerHTML = sessions.map((session) => `
+          <tr>
+            <td><strong>${session.stream_key}</strong><br/><span class="muted"><code>${session.session_key}</code></span><br/><span class="muted">mgr:${session.managed_by || "-"}</span></td>
+            <td>${session.source_protocol || "-"}<br/><span class="muted">${session.direction || "-"}</span></td>
+            <td><span class="pill ${session.state === "stopped" ? "bad" : (session.state === "restarting" ? "warn" : "")}">${session.state || "-"}</span><br/><span class="muted">updated:${formatEpochMs(session.updated_at_epoch_ms)}</span></td>
+            <td><code>${session.public_url || "-"}</code><br/><span class="muted"><code>${session.bind_url || "-"}</code></span></td>
+            <td><code>${session.target_url || "-"}</code></td>
+            <td>pid:${session.pid ?? "-"}<br/>start:${formatEpochMs(session.started_at_epoch_ms)}<br/>stop:${formatEpochMs(session.last_stopped_at_epoch_ms)}<br/>restart:${session.restart_count ?? 0}<br/>exit:${session.last_exit_code ?? "-"}${session.last_error ? `<br/><span class="warn">${session.last_error}</span>` : ""}</td>
+          </tr>
+        `).join("");
+      }
+
+      function renderRtspProxies(proxies) {
+        const tbody = document.getElementById("rtspTable");
+        if (!proxies.length) {
+          tbody.innerHTML = '<tr><td colspan="5" class="muted">No RTSP relays yet.</td></tr>';
+          return;
+        }
+
+        tbody.innerHTML = proxies.map((proxy) => `
+          <tr data-rtsp-row="${proxy.stream_key}">
+            <td><strong>${proxy.stream_key}</strong></td>
+            <td>${proxy.running ? '<span class="pill">running</span>' : '<span class="pill bad">stopped</span>'}</td>
+            <td><code>${proxy.source_url || "-"}</code></td>
+            <td><code>${proxy.target_url || "-"}</code></td>
+            <td>${proxy.pid ?? "-"}</td>
+          </tr>
+        `).join("");
+
+        document.querySelectorAll("[data-rtsp-row]").forEach((row) => {
+          row.addEventListener("click", () => {
+            const streamKey = row.getAttribute("data-rtsp-row");
+            document.getElementById("rtspStreamKey").value = streamKey;
+            refreshRtspLog(streamKey);
+          });
+        });
+      }
+
+      function renderRtspCompat(sessions) {
+        const tbody = document.getElementById("rtspCompatTable");
+        if (!sessions.length) {
+          tbody.innerHTML = '<tr><td colspan="6" class="muted">No RTSP compatibility sessions yet.</td></tr>';
+          return;
+        }
+
+        tbody.innerHTML = sessions.map((session) => `
+          <tr data-rtsp-compat-row="${session.stream_key}">
+            <td><strong>${session.stream_key}</strong></td>
+            <td><code>${session.publish_url || "-"}</code></td>
+            <td><code>${session.play_url || "-"}</code></td>
+            <td>${renderWorkerState(session.publish, session.desired_publish)}</td>
+            <td>${renderWorkerState(session.play, session.desired_play)}</td>
+            <td>${session.native_publish ? `<span class="pill">${session.native_publish.state || "active"}</span><br/>client:${session.native_publish.client_address || "-"}<br/>rtp:${session.native_publish.client_rtp_port || "-"} -> ${session.native_publish.server_rtp_port || "-"}<br/>ffmpeg:${session.native_publish.ffmpeg_pid ?? "-"}` : '<span class="muted">no native publish session</span>'}</td>
+          </tr>
+        `).join("");
+
+        document.querySelectorAll("[data-rtsp-compat-row]").forEach((row) => {
+          row.addEventListener("click", () => {
+            const streamKey = row.getAttribute("data-rtsp-compat-row");
+            document.getElementById("rtspCompatStreamKey").value = streamKey;
+            refreshRtspCompatLog(streamKey, "publish");
+          });
+        });
+      }
+
+      function renderSrtSessions(sessions) {
+        const tbody = document.getElementById("srtTable");
+        if (!sessions.length) {
+          tbody.innerHTML = '<tr><td colspan="6" class="muted">No SRT sessions yet.</td></tr>';
+          return;
+        }
+
+        tbody.innerHTML = sessions.map((session) => `
+          <tr data-srt-row="${session.stream_key}">
+            <td><strong>${session.stream_key}</strong><br/><span class="muted">pub-port:${session.publish_port}</span><br/><span class="muted">play-port:${session.play_port}</span></td>
+            <td><code>${session.publish_url || "-"}</code><br/><span class="muted">${session.publish_listener_url || "-"}</span></td>
+            <td><code>${session.play_url || "-"}</code><br/><span class="muted">${session.play_listener_url || "-"}</span></td>
+            <td>${renderWorkerState(session.publish, session.desired_publish)}</td>
+            <td>${renderWorkerState(session.play, session.desired_play)}</td>
+            <td>target:<br/><code>${session.target_rtmp_url || "-"}</code></td>
+          </tr>
+        `).join("");
+
+        document.querySelectorAll("[data-srt-row]").forEach((row) => {
+          row.addEventListener("click", () => {
+            const streamKey = row.getAttribute("data-srt-row");
+            document.getElementById("srtStreamKey").value = streamKey;
+            refreshSrtLog(streamKey, "publish");
+          });
+        });
+      }
+
+      async function startRtspProxy() {
+        const streamKey = document.getElementById("rtspStreamKey").value.trim();
+        const sourceUrl = document.getElementById("rtspSourceUrl").value.trim();
+        await callJson(`/api/rtsp/proxies/start?stream_key=${encodeURIComponent(streamKey)}&source_url=${encodeURIComponent(sourceUrl)}`, {
+          method: "POST"
+        });
+        await load();
+        await refreshRtspLog(streamKey);
+      }
+
+      async function stopRtspProxy() {
+        const streamKey = document.getElementById("rtspStreamKey").value.trim();
+        await callJson(`/api/rtsp/proxies/stop?stream_key=${encodeURIComponent(streamKey)}`, {
+          method: "POST"
+        });
+        await load();
+        await refreshRtspLog(streamKey);
+      }
+
+      async function startRtspCompat(mode) {
+        const streamKey = document.getElementById("rtspCompatStreamKey").value.trim();
+        await callJson(`/api/rtsp/compat/start?stream_key=${encodeURIComponent(streamKey)}&mode=${encodeURIComponent(mode)}`, {
+          method: "POST"
+        });
+        await load();
+        await refreshRtspCompatLog(streamKey, mode === "play" ? "play" : "publish");
+      }
+
+      async function stopRtspCompat() {
+        const streamKey = document.getElementById("rtspCompatStreamKey").value.trim();
+        await callJson(`/api/rtsp/compat/stop?stream_key=${encodeURIComponent(streamKey)}&mode=both`, {
+          method: "POST"
+        });
+        await load();
+        await refreshRtspCompatLog(streamKey, "publish");
+      }
+
+      async function startSrt(mode) {
+        const streamKey = document.getElementById("srtStreamKey").value.trim();
+        await callJson(`/api/srt/start?stream_key=${encodeURIComponent(streamKey)}&mode=${encodeURIComponent(mode)}`, {
+          method: "POST"
+        });
+        await load();
+        await refreshSrtLog(streamKey, mode === "play" ? "play" : "publish");
+      }
+
+      async function stopSrt() {
+        const streamKey = document.getElementById("srtStreamKey").value.trim();
+        await callJson(`/api/srt/stop?stream_key=${encodeURIComponent(streamKey)}&mode=both`, {
+          method: "POST"
+        });
+        await load();
+        await refreshSrtLog(streamKey, "publish");
+      }
+
+      async function startHls(streamKey) {
+        await callJson(`/api/streams/hls/start?stream_key=${encodeURIComponent(streamKey)}`, { method: "POST" });
+        await load();
+        if (selectedStreamKey === streamKey) {
+          await refreshHlsLog();
+        }
+      }
+
+      async function stopHls(streamKey) {
+        await callJson(`/api/streams/hls/stop?stream_key=${encodeURIComponent(streamKey)}`, { method: "POST" });
+        await load();
+        if (selectedStreamKey === streamKey) {
+          await refreshHlsLog();
+        }
+      }
+
+      async function disconnectStream(streamKey) {
+        await callJson(`/api/streams/disconnect?stream_key=${encodeURIComponent(streamKey)}`, { method: "POST" });
+        await load();
+      }
+
+      function renderStreams(streams) {
+        const tbody = document.getElementById("streamsTable");
+        if (!streams.length) {
+          tbody.innerHTML = '<tr><td colspan="8" class="muted">No active streams yet.</td></tr>';
+          return;
+        }
+
+        const webrtcStreamMap = buildWebrtcStreamMap(currentWebrtc);
+
+        tbody.innerHTML = streams.map((stream) => {
+          const urls = buildUrls(stream.stream_key);
+          const hls = stream.hls || {};
+          const webrtc = webrtcStreamMap.get(stream.stream_key) || null;
+          const hlsBadge = hls.playlist_exists
+            ? '<span class="pill">playlist ready</span>'
+            : (hls.running ? '<span class="pill warn">starting</span>' : '<span class="pill bad">stopped</span>');
+          const bitrate = formatBitrate(
+            stream.total_bytes,
+            stream.first_media_at_epoch_ms,
+            stream.last_media_at_epoch_ms
+          );
+
+          return `
+            <tr data-stream-row="${stream.stream_key}">
+              <td><strong>${stream.stream_key}</strong><br/><span class="muted">src:${stream.source_protocol || "-"}</span><br/><span class="muted">origin:${stream.ingest_origin || "-"}</span><br/><span class="muted">mgr:${stream.managed_by || "-"}</span></td>
+              <td>${stream.has_publisher ? '<span class="pill">publisher online</span>' : '<span class="pill bad">offline</span>'}</td>
+              <td>RTMP: ${stream.viewer_count}<br/>HTTP-FLV: ${stream.http_flv_viewer_count ?? 0}<br/>Total: ${stream.total_viewer_count ?? stream.viewer_count}<br/>WHEP: ${webrtc?.whep_session_count ?? 0}</td>
+              <td>meta:${stream.has_metadata ? "Y" : "N"}<br/>audio-sh:${stream.has_audio_sequence_header ? "Y" : "N"}<br/>video-sh:${stream.has_video_sequence_header ? "Y" : "N"}<br/>gop:${stream.gop_cache_size}</td>
+              <td>vcodec:${stream.video_codec || webrtc?.video_codec || "-"}<br/>acodec:${stream.audio_codec || webrtc?.audio_codec || "-"}<br/>packets:${stream.total_packets ?? 0}<br/>bitrate:${bitrate}<br/>last-key:${stream.last_keyframe_at_epoch_ms ? new Date(stream.last_keyframe_at_epoch_ms).toLocaleTimeString() : "-"}<br/>webrtc:${webrtc ? `${webrtc.whip_session_count ?? 0} pub / ${webrtc.whep_session_count ?? 0} play` : "-"}</td>
+              <td><code>${urls.rtmp}</code><br/><code>${urls.flv}</code><br/><code>${urls.hls}</code><br/><code>${urls.hlsMaster}</code></td>
+              <td>${hlsBadge}<br/>pid:${hls.pid ?? "-"}<br/>exit:${hls.last_exit_code ?? "-"}<br/>restart:${hls.restart_count ?? 0}<br/>bridge:${webrtc ? (webrtc.recorder_started ? "active" : (webrtc.bridge_active ? "ready" : "off")) : "-"}</td>
+              <td>
+                <button class="good" data-action="play-flv" data-url="${urls.flv}">Play FLV</button>
+                <button class="secondary" data-action="copy-hls" data-url="${urls.hls}">Use HLS</button>
+                <button data-action="start-hls" data-stream="${stream.stream_key}">Start HLS</button>
+                <button class="secondary" data-action="stop-hls" data-stream="${stream.stream_key}">Stop HLS</button>
+                <button data-action="disconnect" data-stream="${stream.stream_key}">Disconnect</button>
+              </td>
+            </tr>
+          `;
+        }).join("");
+
+        document.querySelectorAll("[data-stream-row]").forEach((row) => {
+          row.addEventListener("click", (event) => {
+            if (event.target.closest("button")) {
+              return;
+            }
+            selectStream(row.getAttribute("data-stream-row"));
+          });
+        });
+
+        document.querySelectorAll("button[data-action]").forEach((button) => {
+          button.addEventListener("click", async () => {
+            const action = button.getAttribute("data-action");
+            const streamKey = button.getAttribute("data-stream");
+            const url = button.getAttribute("data-url");
+            button.disabled = true;
+            try {
+              if (action === "play-flv") {
+                document.getElementById("playUrl").value = url;
+                playCurrentUrl();
+              } else if (action === "copy-hls") {
+                document.getElementById("playUrl").value = url;
+                document.getElementById("playerStatus").textContent = "HLS URL filled into the player box.";
+              } else if (action === "start-hls") {
+                await startHls(streamKey);
+              } else if (action === "stop-hls") {
+                await stopHls(streamKey);
+              } else if (action === "disconnect") {
+                await disconnectStream(streamKey);
+              }
+            } finally {
+              button.disabled = false;
+            }
+          });
+        });
+      }
+
+      async function load() {
+        let health = {
+          ok: false,
+          dataPlane: { listen: "-" },
+          streamCount: 0,
+          totalViewers: 0,
+          apiBase: "-",
+          hlsRoot: "-",
+          hlsAutoStart: true
+        };
+        let streamsState = { streams: [] };
+        let webrtcState = { sessions: [], published_streams: [] };
+        let webrtcHealth = { ok: false, service: "otts-webrtc-gateway" };
+        let systemStatus = { managed_processes: [] };
+        let rtspState = { proxies: [] };
+        let rtspCompatState = { sessions: [] };
+        let srtState = { sessions: [], summary: {} };
+        let protocolSessionsState = { sessions: [] };
+
+        try {
+          const [healthRes, streamsRes, webrtcRes, webrtcHealthRes, systemStatusRes, rtspRes, rtspCompatRes, srtRes, protocolSessionsRes] = await Promise.all([
+            fetch("/api/health"),
+            fetch("/api/streams"),
+            fetch("/api/webrtc/sessions"),
+            fetch("/api/webrtc/health"),
+            fetch("/api/system/status"),
+            fetch("/api/rtsp/proxies"),
+            fetch("/api/rtsp/compat"),
+            fetch("/api/srt/sessions"),
+            fetch("/api/protocol/sessions")
+          ]);
+          health = await healthRes.json();
+          streamsState = await streamsRes.json();
+          webrtcState = await webrtcRes.json();
+          webrtcHealth = await webrtcHealthRes.json();
+          systemStatus = await systemStatusRes.json();
+          rtspState = await rtspRes.json();
+          rtspCompatState = await rtspCompatRes.json();
+          srtState = await srtRes.json();
+          protocolSessionsState = await protocolSessionsRes.json();
+        } catch (error) {
+          document.getElementById("healthSummary").textContent = `Load failed: ${error.message}`;
+        }
+
+        currentState = streamsState;
+        currentWebrtc = webrtcState;
+        currentRuntime = systemStatus;
+        currentRtsp = rtspState;
+        currentRtspCompat = rtspCompatState;
+        currentSrt = srtState;
+        currentProtocolSessions = protocolSessionsState;
+        const streamSummary = health.streamSummary || {};
+        const sourceSummary = Object.entries(streamSummary.by_source_protocol || {})
+          .map(([source, count]) => `${source}:${count}`)
+          .join(", ") || "none";
+        const originSummary = Object.entries(streamSummary.by_ingest_origin || {})
+          .map(([origin, count]) => `${origin}:${count}`)
+          .join(", ") || "none";
+        const managerSummary = Object.entries(streamSummary.by_manager || {})
+          .map(([manager, count]) => `${manager}:${count}`)
+          .join(", ") || "none";
+        document.getElementById("rtmpListen").textContent = health.dataPlane?.listen || "-";
+        document.getElementById("httpApiPort").textContent = health.http_api_port || "-";
+        document.getElementById("streamCount").textContent = health.streamCount ?? 0;
+        document.getElementById("totalViewers").textContent = health.totalViewers ?? 0;
+        document.getElementById("publishersOnline").textContent = streamSummary.publisher_online_count ?? 0;
+        document.getElementById("streamSources").textContent = sourceSummary;
+        document.getElementById("streamOrigins").textContent = originSummary;
+        document.getElementById("streamManagers").textContent = managerSummary;
+        document.getElementById("apiBase").textContent = health.apiBase || "-";
+        document.getElementById("hlsRoot").textContent = health.hlsRoot || "-";
+        document.getElementById("managedProcesses").textContent =
+          `${health.managedProcessOnlineCount ?? 0}/${health.managedProcessCount ?? 0}`;
+        document.getElementById("rtspNativePublish").textContent = health.rtspNativePublishCount ?? 0;
+        document.getElementById("rtspNativeRecording").textContent = health.rtspNativeRecordingCount ?? 0;
+        document.getElementById("rtspCompatDesired").textContent =
+          `${health.rtspCompatPublishDesiredCount ?? 0}/${health.rtspCompatPlayDesiredCount ?? 0}`;
+        document.getElementById("srtSessions").textContent = health.srtSessionCount ?? 0;
+        document.getElementById("srtPublishPlay").textContent = `${health.srtPublishCount ?? 0}/${health.srtPlayCount ?? 0}`;
+        document.getElementById("srtRunning").textContent =
+          `${health.srtPublishRunningCount ?? 0}/${health.srtPlayRunningCount ?? 0}`;
+        document.getElementById("webrtcGateway").textContent = webrtcHealth.ok
+          ? `${health.webrtcGatewayBase || "-"} OK`
+          : `${health.webrtcGatewayBase || "-"} DOWN`;
+        document.getElementById("healthSummary").innerHTML = health.ok
+          ? `OTTS core is online. RTMP on <code>:${health.dataPlane.listen}</code>, C++ API on <code>:${health.http_api_port}</code>, Node debug panel on <code>:3000</code>, HLS auto-start: <code>${health.hlsAutoStart}</code>, WebRTC gateway: <code>${health.webrtcGatewayBase || "-"}</code>, managed services: <code>${health.managedProcessOnlineCount ?? 0}/${health.managedProcessCount ?? 0}</code>, RTSP desired publish/play: <code>${health.rtspCompatPublishDesiredCount ?? 0}/${health.rtspCompatPlayDesiredCount ?? 0}</code>, SRT running publish/play: <code>${health.srtPublishRunningCount ?? 0}/${health.srtPlayRunningCount ?? 0}</code>, stream sources: <code>${sourceSummary}</code>.`
+          : '<span class="warn">OTTS core is unreachable from Node right now.</span>';
+
+        renderStreams(streamsState.streams || []);
+        renderWebrtcSessions(webrtcState.sessions || []);
+        renderRuntimeProcesses(systemStatus);
+        renderProtocolSessions(protocolSessionsState.sessions || []);
+        renderRtspProxies(rtspState.proxies || []);
+        renderRtspCompat(rtspCompatState.merged_sessions || rtspCompatState.sessions || []);
+        renderSrtSessions(srtState.sessions || []);
+        renderSelectedStream();
+      }
+
+      document.getElementById("playBtn").addEventListener("click", playCurrentUrl);
+      document.getElementById("stopBtn").addEventListener("click", stopPlayer);
+      document.getElementById("rtspStartBtn").addEventListener("click", startRtspProxy);
+      document.getElementById("rtspStopBtn").addEventListener("click", stopRtspProxy);
+      document.getElementById("rtspCompatStartBtn").addEventListener("click", () => startRtspCompat("both"));
+      document.getElementById("rtspCompatStartPublishBtn").addEventListener("click", () => startRtspCompat("publish"));
+      document.getElementById("rtspCompatStartPlayBtn").addEventListener("click", () => startRtspCompat("play"));
+      document.getElementById("rtspCompatStopBtn").addEventListener("click", stopRtspCompat);
+      document.getElementById("srtStartBtn").addEventListener("click", () => startSrt("both"));
+      document.getElementById("srtStartPublishBtn").addEventListener("click", () => startSrt("publish"));
+      document.getElementById("srtStartPlayBtn").addEventListener("click", () => startSrt("play"));
+      document.getElementById("srtStopBtn").addEventListener("click", stopSrt);
+
+      load();
+      refreshRuntimeLog();
+      setInterval(load, 2000);
+      setInterval(refreshRuntimeLog, 4000);
+      setInterval(() => {
+        if (selectedStreamKey) {
+          refreshHlsLog();
+        }
+      }, 4000);
+    </script>
+  </body>
+</html>

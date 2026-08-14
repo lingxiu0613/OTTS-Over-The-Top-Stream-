@@ -1,0 +1,375 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>OTTS WebRTC Test</title>
+    <style>
+      :root {
+        --bg: #0b1220;
+        --panel: rgba(15, 23, 42, 0.95);
+        --line: #243041;
+        --text: #e5e7eb;
+        --muted: #94a3b8;
+      }
+
+      body {
+        margin: 0;
+        font-family: "Segoe UI", sans-serif;
+        background: linear-gradient(180deg, #111827 0%, #0b1220 100%);
+        color: var(--text);
+      }
+
+      main {
+        max-width: 1100px;
+        margin: 0 auto;
+        padding: 24px 18px 48px;
+      }
+
+      .card {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 18px;
+        padding: 18px;
+        margin-bottom: 16px;
+      }
+
+      .grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 16px;
+      }
+
+      @media (max-width: 900px) {
+        .grid {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      input,
+      button,
+      pre,
+      video {
+        width: 100%;
+        box-sizing: border-box;
+        border-radius: 12px;
+      }
+
+      input {
+        padding: 10px 12px;
+        border: 1px solid var(--line);
+        background: #09101d;
+        color: var(--text);
+      }
+
+      button {
+        border: 0;
+        padding: 10px 12px;
+        background: #ea580c;
+        color: white;
+        cursor: pointer;
+        margin-top: 8px;
+      }
+
+      button.secondary {
+        background: #334155;
+      }
+
+      video {
+        background: #000;
+        min-height: 240px;
+        margin-top: 12px;
+      }
+
+      pre {
+        margin: 0;
+        min-height: 180px;
+        overflow: auto;
+        padding: 12px;
+        border: 1px solid var(--line);
+        background: #09101d;
+        color: var(--text);
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+
+      .muted {
+        color: var(--muted);
+      }
+
+      .field-label {
+        display: block;
+        margin: 8px 0 6px;
+        color: var(--muted);
+        font-size: 14px;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div class="card">
+        <h1>OTTS WebRTC Test</h1>
+        <p class="muted">This page tests OTTS WHIP/WHEP through the Node proxy. WHIP publishes webcam/mic into the RTMP core bridge, and WHEP plays the same stream key back from the core.</p>
+        <p class="muted" id="securityHint"></p>
+      </div>
+
+      <div class="grid">
+        <div class="card">
+          <h2>WHIP Publish</h2>
+          <label class="field-label" for="whipStreamKey">Publish Stream Key</label>
+          <p><input id="whipStreamKey" value="live/webrtc-demo" /></p>
+          <label class="field-label" for="whipPublishUrl">WHIP Publish URL</label>
+          <p><input id="whipPublishUrl" value="" /></p>
+          <button id="startPublish">Start WHIP Publish</button>
+          <button id="stopPublish" class="secondary">Stop Publish</button>
+          <video id="localVideo" autoplay muted playsinline></video>
+          <p class="muted" id="publishStatus">Idle</p>
+        </div>
+
+        <div class="card">
+          <h2>WHEP Play</h2>
+          <label class="field-label" for="whepStreamKey">Play Stream Key</label>
+          <p><input id="whepStreamKey" value="live/webrtc-demo" /></p>
+          <label class="field-label" for="whepPlayUrl">WHEP Play URL</label>
+          <p><input id="whepPlayUrl" value="" /></p>
+          <button id="startPlay">Start WHEP Play</button>
+          <button id="stopPlay" class="secondary">Stop Play</button>
+          <video id="remoteVideo" autoplay playsinline controls></video>
+          <p class="muted" id="playStatus">Idle</p>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Session Log</h2>
+        <pre id="log"></pre>
+      </div>
+    </main>
+
+    <script>
+      const proxyBase = window.location.origin;
+      const logBox = document.getElementById("log");
+      const whipStreamKeyInput = document.getElementById("whipStreamKey");
+      const whepStreamKeyInput = document.getElementById("whepStreamKey");
+      const whipPublishUrlInput = document.getElementById("whipPublishUrl");
+      const whepPlayUrlInput = document.getElementById("whepPlayUrl");
+
+      let publishPc = null;
+      let publishStream = null;
+      let publishSessionUrl = null;
+
+      let playPc = null;
+      let playSessionUrl = null;
+
+      function updateSecurityHint() {
+        const hint = document.getElementById("securityHint");
+        const hasMediaApi = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+        if (window.isSecureContext && hasMediaApi) {
+          hint.textContent = "Secure context ready. Browser WHIP publish should be allowed.";
+          return;
+        }
+        hint.textContent =
+          "This page is not running in a secure browser context. For WHIP publish from the browser, use HTTPS or open it from localhost on the Ubuntu machine.";
+      }
+
+      function log(message, data) {
+        const line = `[${new Date().toLocaleTimeString()}] ${message}`;
+        const payload = data ? `\n${JSON.stringify(data, null, 2)}` : "";
+        logBox.textContent = `${line}${payload}\n\n${logBox.textContent}`;
+      }
+
+      function buildWhipUrl(streamKey) {
+        return `${proxyBase}/whip/v1?stream_key=${encodeURIComponent(streamKey)}`;
+      }
+
+      function buildWhepUrl(streamKey) {
+        return `${proxyBase}/whep/v1?stream_key=${encodeURIComponent(streamKey)}`;
+      }
+
+      function normalizeWebRtcUrl(rawUrl, fallbackUrl) {
+        const candidate = (rawUrl || "").trim();
+        if (!candidate) {
+          return fallbackUrl;
+        }
+
+        let parsed;
+        try {
+          parsed = new URL(candidate, window.location.origin);
+        } catch (_error) {
+          return candidate;
+        }
+
+        if (
+          window.location.protocol === "https:" &&
+          parsed.protocol === "http:" &&
+          parsed.hostname === window.location.hostname &&
+          parsed.pathname.startsWith("/rtc/v1/")
+        ) {
+          return `${window.location.origin}${parsed.pathname}${parsed.search}`;
+        }
+
+        return parsed.toString();
+      }
+
+      function syncPublishUrl() {
+        const streamKey = whipStreamKeyInput.value.trim() || "live/webrtc-demo";
+        whipPublishUrlInput.value = buildWhipUrl(streamKey);
+      }
+
+      function syncPlayUrl() {
+        const streamKey = whepStreamKeyInput.value.trim() || "live/webrtc-demo";
+        whepPlayUrlInput.value = buildWhepUrl(streamKey);
+      }
+
+      function getPublishTarget() {
+        const streamKey = whipStreamKeyInput.value.trim();
+        const url = normalizeWebRtcUrl(
+          whipPublishUrlInput.value,
+          buildWhipUrl(streamKey)
+        );
+        return { streamKey, url };
+      }
+
+      function getPlayTarget() {
+        const streamKey = whepStreamKeyInput.value.trim();
+        const url = normalizeWebRtcUrl(
+          whepPlayUrlInput.value,
+          buildWhepUrl(streamKey)
+        );
+        return { streamKey, url };
+      }
+
+      async function waitIceComplete(pc, timeoutMs = 5000) {
+        const started = Date.now();
+        while (pc.iceGatheringState !== "complete" && Date.now() - started < timeoutMs) {
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+      }
+
+      async function startPublish() {
+        const { streamKey, url } = getPublishTarget();
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+          throw new Error("getUserMedia unavailable in this browser context; use HTTPS or localhost");
+        }
+        publishStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+        document.getElementById("localVideo").srcObject = publishStream;
+
+        publishPc = new RTCPeerConnection();
+        publishStream.getTracks().forEach((track) => publishPc.addTrack(track, publishStream));
+
+        const offer = await publishPc.createOffer();
+        await publishPc.setLocalDescription(offer);
+        await waitIceComplete(publishPc);
+
+        const response = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/sdp" },
+          body: publishPc.localDescription.sdp
+        });
+
+        if (!response.ok) {
+          const text = await response.text();
+          throw new Error(text || `WHIP failed: ${response.status}`);
+        }
+
+        const answerSdp = await response.text();
+        publishSessionUrl = response.headers.get("Location")
+          ? `${proxyBase}${response.headers.get("Location")}`
+          : null;
+
+        await publishPc.setRemoteDescription({ type: "answer", sdp: answerSdp });
+        document.getElementById("publishStatus").textContent = `Publishing to ${streamKey}`;
+        log("WHIP publish established", { streamKey, url, sessionUrl: publishSessionUrl });
+      }
+
+      async function stopPublish() {
+        if (publishSessionUrl) {
+          await fetch(publishSessionUrl, { method: "DELETE" }).catch(() => {});
+        }
+        if (publishPc) {
+          publishPc.close();
+          publishPc = null;
+        }
+        if (publishStream) {
+          publishStream.getTracks().forEach((track) => track.stop());
+          publishStream = null;
+        }
+        document.getElementById("localVideo").srcObject = null;
+        document.getElementById("publishStatus").textContent = "Stopped";
+      }
+
+      async function startPlay() {
+        const { streamKey, url } = getPlayTarget();
+        playPc = new RTCPeerConnection();
+        playPc.addTransceiver("video", { direction: "recvonly" });
+        playPc.addTransceiver("audio", { direction: "recvonly" });
+
+        playPc.ontrack = (event) => {
+          const [stream] = event.streams;
+          document.getElementById("remoteVideo").srcObject = stream;
+        };
+
+        const offer = await playPc.createOffer();
+        await playPc.setLocalDescription(offer);
+        await waitIceComplete(playPc);
+
+        const response = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/sdp" },
+          body: playPc.localDescription.sdp
+        });
+
+        if (!response.ok) {
+          const text = await response.text();
+          throw new Error(text || `WHEP failed: ${response.status}`);
+        }
+
+        const answerSdp = await response.text();
+        playSessionUrl = response.headers.get("Location")
+          ? `${proxyBase}${response.headers.get("Location")}`
+          : null;
+        await playPc.setRemoteDescription({ type: "answer", sdp: answerSdp });
+        document.getElementById("playStatus").textContent = `Playing ${streamKey}`;
+        log("WHEP playback established", { streamKey, url, sessionUrl: playSessionUrl });
+      }
+
+      async function stopPlay() {
+        if (playSessionUrl) {
+          await fetch(playSessionUrl, { method: "DELETE" }).catch(() => {});
+        }
+        if (playPc) {
+          playPc.close();
+          playPc = null;
+        }
+        document.getElementById("remoteVideo").srcObject = null;
+        document.getElementById("playStatus").textContent = "Stopped";
+      }
+
+      document.getElementById("startPublish").addEventListener("click", async () => {
+        try {
+          await startPublish();
+        } catch (error) {
+          document.getElementById("publishStatus").textContent = error.message;
+          log("WHIP publish failed", { error: error.message });
+        }
+      });
+
+      document.getElementById("stopPublish").addEventListener("click", stopPublish);
+
+      document.getElementById("startPlay").addEventListener("click", async () => {
+        try {
+          await startPlay();
+        } catch (error) {
+          document.getElementById("playStatus").textContent = error.message;
+          log("WHEP play failed", { error: error.message });
+        }
+      });
+
+      document.getElementById("stopPlay").addEventListener("click", stopPlay);
+      whipStreamKeyInput.addEventListener("input", syncPublishUrl);
+      whepStreamKeyInput.addEventListener("input", syncPlayUrl);
+      syncPublishUrl();
+      syncPlayUrl();
+      updateSecurityHint();
+    </script>
+  </body>
+</html>
