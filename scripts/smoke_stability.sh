@@ -83,7 +83,13 @@ if kill -0 "${PUBLISH_A_PID}" 2>/dev/null; then
 fi
 echo "[OK] duplicate publisher replacement handled"
 
-wait "${PUBLISH_B_PID}" || true
+for _ in $(seq 1 20); do
+  if ! kill -0 "${PUBLISH_B_PID}" 2>/dev/null; then
+    break
+  fi
+  sleep 0.5
+done
+kill "${PUBLISH_B_PID}" 2>/dev/null || true
 PUBLISH_B_PID=0
 wait_stream_absent
 echo "[OK] stream state cleaned after publisher stop"

@@ -10,6 +10,9 @@ fi
 echo "[OTTS] native protocol smoke suite"
 echo "[OTTS] input: ${INPUT_FILE}"
 
+"${ROOT_DIR}/scripts/smoke_observability.sh"
+echo
+
 "${ROOT_DIR}/scripts/smoke_rtmp.sh" live/rtmp-smoke
 echo
 
@@ -26,6 +29,12 @@ echo
 python3 "${ROOT_DIR}/python/smoke_webrtc_native.py" \
   --base-url http://127.0.0.1:1985 \
   --stream-key live/webrtc-smoke
+echo
+
+"${ROOT_DIR}/scripts/smoke_hls.sh" live/hls-smoke
+echo
+
+"${ROOT_DIR}/scripts/smoke_recording.sh" live/recording-smoke
 echo
 
 "${ROOT_DIR}/scripts/smoke_stability.sh" live/stability-smoke
