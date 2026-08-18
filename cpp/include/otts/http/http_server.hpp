@@ -40,6 +40,7 @@ private:
         const std::string& status = "201 Created") const;
     std::string build_streams_json() const;
     std::string build_protocol_sessions_json() const;
+    std::string build_maintenance_json() const;
     bool handle_disconnect_request(const std::string& request_path);
     std::string build_flv_stats_json() const;
     std::string build_webrtc_sessions_json() const;

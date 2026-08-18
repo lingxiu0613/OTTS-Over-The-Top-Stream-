@@ -669,6 +669,51 @@ bool WebRtcService::fail_session(const std::string& session_id, const std::strin
     return true;
 }
 
+std::size_t WebRtcService::cleanup_stale_sessions(std::uint64_t terminal_session_retention_ms) {
+    if (terminal_session_retention_ms == 0) {
+        return 0;
+    }
+
+    std::vector<std::shared_ptr<NativeSession>> native_to_close;
+    std::vector<std::pair<otts::rtmp::StreamRegistry*, std::string>> registry_sessions;
+    std::size_t removed = 0;
+    const auto now_ms = now_epoch_ms();
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto it = sessions_.begin(); it != sessions_.end();) {
+            const auto terminal = it->second.state == SessionState::Closed || it->second.state == SessionState::Failed;
+            const auto expired = terminal && now_ms > it->second.updated_at_epoch_ms &&
+                                 now_ms - it->second.updated_at_epoch_ms > terminal_session_retention_ms;
+            if (!expired) {
+                ++it;
+                continue;
+            }
+
+            if (const auto native_it = native_sessions_.find(it->first); native_it != native_sessions_.end()) {
+                native_to_close.push_back(native_it->second);
+                if (native_it->second->registry) {
+                    registry_sessions.emplace_back(native_it->second->registry, native_it->second->session_id);
+                }
+                native_sessions_.erase(native_it);
+            }
+            it = sessions_.erase(it);
+            removed += 1;
+        }
+    }
+
+    for (const auto& native_session : native_to_close) {
+        native_session->close_now();
+    }
+    for (const auto& [registry, session_id] : registry_sessions) {
+        registry->remove_external_session("cpp-webrtc:" + session_id);
+    }
+    if (removed > 0) {
+        otts::core::log_info("webrtc_service", "cleanup removed_terminal_sessions=" + std::to_string(removed));
+    }
+    return removed;
+}
+
 void WebRtcService::update_session_state(
     const std::string& session_id,
     SessionState state,

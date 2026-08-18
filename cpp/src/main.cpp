@@ -109,6 +109,18 @@ std::uint16_t env_port(const char* name, std::uint16_t fallback) {
     return fallback;
 }
 
+std::uint64_t env_u64(const char* name, std::uint64_t fallback) {
+    const auto value = env_string(name);
+    if (value.empty()) {
+        return fallback;
+    }
+    try {
+        return static_cast<std::uint64_t>(std::stoull(value));
+    } catch (...) {
+        return fallback;
+    }
+}
+
 otts::webrtc::RuntimeMode parse_webrtc_runtime_mode(const std::string& value) {
     if (value == "native") {
         return otts::webrtc::RuntimeMode::Native;
@@ -175,6 +187,9 @@ int main() {
     const auto cpp_srt_publish_port = env_port("OTTS_CPP_SRT_PUBLISH_PORT", env_port("OTTS_SRT_PUBLISH_PORT_BASE", 0));
     const auto cpp_srt_play_port = env_port("OTTS_CPP_SRT_PLAY_PORT", env_port("OTTS_SRT_PLAY_PORT_BASE", 0));
     const auto cpp_srt_stream_key = env_string("OTTS_CPP_SRT_STREAM_KEY", "live/srt-demo");
+    const auto cleanup_interval_ms = env_u64("OTTS_CLEANUP_INTERVAL_MS", 5000);
+    const auto external_publisher_idle_ms = env_u64("OTTS_EXTERNAL_PUBLISHER_IDLE_MS", 30000);
+    const auto stopped_session_retention_ms = env_u64("OTTS_STOPPED_SESSION_RETENTION_MS", 60000);
 
     otts::rtmp::RtmpServer server(rtmp_port);
     if (!server.start()) {
@@ -296,6 +311,9 @@ int main() {
                                       cpp_rtsp_play_port,
                                       cpp_srt_publish_port,
                                       cpp_srt_play_port,
+                                      cleanup_interval_ms,
+                                      external_publisher_idle_ms,
+                                      stopped_session_retention_ms,
                                       should_start_webrtc_gateway,
                                       &webrtc_service]() {
         const auto now_ms = now_epoch_ms();
@@ -315,6 +333,11 @@ int main() {
              << "\"cpp_rtsp_play\":" << cpp_rtsp_play_port << ","
              << "\"cpp_srt_publish\":" << cpp_srt_publish_port << ","
              << "\"cpp_srt_play\":" << cpp_srt_play_port
+             << "},";
+        body << "\"maintenance\":{"
+             << "\"cleanup_interval_ms\":" << cleanup_interval_ms << ","
+             << "\"external_publisher_idle_ms\":" << external_publisher_idle_ms << ","
+             << "\"stopped_session_retention_ms\":" << stopped_session_retention_ms
              << "},";
         body << "\"managed_processes\":[";
         if (should_start_webrtc_gateway) {
@@ -355,7 +378,15 @@ int main() {
 
     otts::core::log_info("main", "OTTS native protocol core started with RTMP/FLV/HLS, RTSP, SRT, WHIP/WHEP services");
 
+    auto last_cleanup_at = now_epoch_ms();
     while (g_running.load()) {
+        const auto now_ms = now_epoch_ms();
+        if (cleanup_interval_ms > 0 && now_ms >= last_cleanup_at &&
+            now_ms - last_cleanup_at >= cleanup_interval_ms) {
+            server.registry().cleanup_stale(external_publisher_idle_ms, stopped_session_retention_ms);
+            webrtc_service.cleanup_stale_sessions(stopped_session_retention_ms);
+            last_cleanup_at = now_ms;
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
 

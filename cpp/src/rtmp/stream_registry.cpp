@@ -88,7 +88,15 @@ void StreamRegistry::unregister_publisher(const std::shared_ptr<RtmpSession>& se
             it->second.publisher.reset();
         }
 
-        if (it->second.publisher.expired() && it->second.subscribers.empty()) {
+        it->second.subscribers.erase(
+            std::remove_if(
+                it->second.subscribers.begin(),
+                it->second.subscribers.end(),
+                [](const std::weak_ptr<RtmpSession>& weak) { return weak.expired(); }),
+            it->second.subscribers.end());
+
+        if (it->second.publisher.expired() && !it->second.external_publisher_active && it->second.subscribers.empty() &&
+            it->second.callback_subscribers.empty() && it->second.external_viewer_count == 0) {
             it = streams_.erase(it);
         } else {
             ++it;
@@ -147,7 +155,8 @@ void StreamRegistry::remove_subscriber(const std::shared_ptr<RtmpSession>& sessi
                 }),
             subscribers.end());
 
-        if (it->second.publisher.expired() && subscribers.empty()) {
+        if (it->second.publisher.expired() && !it->second.external_publisher_active && subscribers.empty() &&
+            it->second.callback_subscribers.empty() && it->second.external_viewer_count == 0) {
             it = streams_.erase(it);
         } else {
             ++it;
@@ -207,7 +216,8 @@ void StreamRegistry::remove_callback_subscriber(const std::string& stream_key, C
             [&](const CallbackSubscriber& subscriber) { return subscriber.id == callback_id; }),
         callbacks.end());
 
-    if (it->second.publisher.expired() && it->second.subscribers.empty() && callbacks.empty()) {
+    if (it->second.publisher.expired() && !it->second.external_publisher_active && it->second.subscribers.empty() &&
+        callbacks.empty() && it->second.external_viewer_count == 0) {
         streams_.erase(it);
     }
 
@@ -487,6 +497,84 @@ std::vector<StreamRegistry::ExternalSessionSnapshot> StreamRegistry::external_se
     return result;
 }
 
+StreamRegistry::CleanupStats StreamRegistry::cleanup_stale(
+    std::uint64_t external_publisher_idle_ms,
+    std::uint64_t stopped_session_retention_ms) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto now_ms = now_epoch_ms();
+    CleanupStats delta;
+    delta.runs = 1;
+    delta.last_run_epoch_ms = now_ms;
+
+    for (auto it = streams_.begin(); it != streams_.end();) {
+        auto& stream = it->second;
+        const auto before_subscribers = stream.subscribers.size();
+        stream.subscribers.erase(
+            std::remove_if(
+                stream.subscribers.begin(),
+                stream.subscribers.end(),
+                [](const std::weak_ptr<RtmpSession>& weak) { return weak.expired(); }),
+            stream.subscribers.end());
+        delta.expired_subscribers += before_subscribers - stream.subscribers.size();
+
+        if (stream.external_publisher_active && external_publisher_idle_ms > 0 && stream.last_media_at_epoch_ms > 0 &&
+            now_ms > stream.last_media_at_epoch_ms && now_ms - stream.last_media_at_epoch_ms > external_publisher_idle_ms) {
+            stream.external_publisher_active = false;
+            delta.inactive_external_publishers += 1;
+            otts::core::log_warn(
+                "stream_registry",
+                "cleared inactive external publisher key=" + it->first +
+                    " idle_ms=" + std::to_string(now_ms - stream.last_media_at_epoch_ms));
+        }
+
+        if (stream.publisher.expired() && !stream.external_publisher_active && stream.subscribers.empty() &&
+            stream.callback_subscribers.empty() && stream.external_viewer_count == 0) {
+            it = streams_.erase(it);
+            delta.removed_streams += 1;
+        } else {
+            ++it;
+        }
+    }
+
+    for (auto it = external_sessions_.begin(); it != external_sessions_.end();) {
+        const auto& state = it->second;
+        const bool terminal =
+            state.state == "stopped" || state.state == "closed" || state.state == "failed" || state.state == "error";
+        if (terminal && stopped_session_retention_ms > 0 && now_ms > state.updated_at_epoch_ms &&
+            now_ms - state.updated_at_epoch_ms > stopped_session_retention_ms) {
+            it = external_sessions_.erase(it);
+            delta.removed_external_sessions += 1;
+        } else {
+            ++it;
+        }
+    }
+
+    cleanup_stats_.runs += delta.runs;
+    cleanup_stats_.expired_subscribers += delta.expired_subscribers;
+    cleanup_stats_.inactive_external_publishers += delta.inactive_external_publishers;
+    cleanup_stats_.removed_streams += delta.removed_streams;
+    cleanup_stats_.removed_external_sessions += delta.removed_external_sessions;
+    cleanup_stats_.last_run_epoch_ms = now_ms;
+
+    if (delta.expired_subscribers || delta.inactive_external_publishers || delta.removed_streams ||
+        delta.removed_external_sessions) {
+        otts::core::log_info(
+            "stream_registry",
+            "cleanup expired_subscribers=" + std::to_string(delta.expired_subscribers) +
+                " inactive_external_publishers=" + std::to_string(delta.inactive_external_publishers) +
+                " removed_streams=" + std::to_string(delta.removed_streams) +
+                " removed_external_sessions=" + std::to_string(delta.removed_external_sessions));
+    }
+
+    persist_state_locked();
+    return delta;
+}
+
+StreamRegistry::CleanupStats StreamRegistry::cleanup_stats() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return cleanup_stats_;
+}
+
 std::optional<StreamRegistry::RtspDescribeInfo> StreamRegistry::rtsp_describe_info(const std::string& stream_key) const {
     std::lock_guard<std::mutex> lock(mutex_);
     const auto it = streams_.find(stream_key);
@@ -698,7 +786,15 @@ void StreamRegistry::persist_state_locked() const {
     }
 
     file << "{\n";
-    file << "  \"updated_at_epoch_ms\": 0,\n";
+    file << "  \"updated_at_epoch_ms\": " << now_epoch_ms() << ",\n";
+    file << "  \"cleanup\": {\n";
+    file << "    \"runs\": " << cleanup_stats_.runs << ",\n";
+    file << "    \"expired_subscribers\": " << cleanup_stats_.expired_subscribers << ",\n";
+    file << "    \"inactive_external_publishers\": " << cleanup_stats_.inactive_external_publishers << ",\n";
+    file << "    \"removed_streams\": " << cleanup_stats_.removed_streams << ",\n";
+    file << "    \"removed_external_sessions\": " << cleanup_stats_.removed_external_sessions << ",\n";
+    file << "    \"last_run_epoch_ms\": " << cleanup_stats_.last_run_epoch_ms << "\n";
+    file << "  },\n";
     file << "  \"streams\": [\n";
 
     bool first = true;

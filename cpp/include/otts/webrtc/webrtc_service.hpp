@@ -85,6 +85,7 @@ public:
     std::optional<SessionSnapshot> snapshot(const std::string& session_id) const;
     bool close_session(const std::string& session_id);
     bool fail_session(const std::string& session_id, const std::string& error);
+    std::size_t cleanup_stale_sessions(std::uint64_t terminal_session_retention_ms);
     NativeStatus native_status() const;
     bool should_use_gateway() const;
     bool requires_native_http_answer() const;

@@ -432,6 +432,34 @@ std::string HttpServer::handle_request(const std::string& request) {
         return make_json_response(build_protocol_sessions_json());
     }
 
+    if (method == "GET" && path == "/api/maintenance") {
+        return make_json_response(build_maintenance_json());
+    }
+
+    if (method == "POST" && path.rfind("/api/maintenance/cleanup", 0) == 0) {
+        auto parse_u64 = [](const std::optional<std::string>& value, std::uint64_t fallback) {
+            if (!value.has_value()) {
+                return fallback;
+            }
+            try {
+                return static_cast<std::uint64_t>(std::stoull(*value));
+            } catch (...) {
+                return fallback;
+            }
+        };
+        const auto external_idle_ms = parse_u64(extract_query_param(path, "external_idle_ms"), 30000);
+        const auto stopped_retention_ms = parse_u64(extract_query_param(path, "stopped_retention_ms"), 60000);
+        const auto delta = registry_.cleanup_stale(external_idle_ms, stopped_retention_ms);
+        std::ostringstream body;
+        body << "{\"ok\":true,"
+             << "\"expired_subscribers\":" << delta.expired_subscribers << ","
+             << "\"inactive_external_publishers\":" << delta.inactive_external_publishers << ","
+             << "\"removed_streams\":" << delta.removed_streams << ","
+             << "\"removed_external_sessions\":" << delta.removed_external_sessions << ","
+             << "\"last_run_epoch_ms\":" << delta.last_run_epoch_ms << "}";
+        return make_json_response(body.str());
+    }
+
     if (method == "GET" && path.rfind("/api/rtsp/describe", 0) == 0) {
         const auto stream_key = extract_query_param(path, "stream_key").value_or("");
         if (stream_key.empty()) {
@@ -919,6 +947,23 @@ std::string HttpServer::build_protocol_sessions_json() const {
     }
 
     body << "]}";
+    return body.str();
+}
+
+std::string HttpServer::build_maintenance_json() const {
+    const auto stats = registry_.cleanup_stats();
+    std::ostringstream body;
+    body << "{";
+    body << "\"ok\":true,";
+    body << "\"cleanup\":{";
+    body << "\"runs\":" << stats.runs << ",";
+    body << "\"expired_subscribers\":" << stats.expired_subscribers << ",";
+    body << "\"inactive_external_publishers\":" << stats.inactive_external_publishers << ",";
+    body << "\"removed_streams\":" << stats.removed_streams << ",";
+    body << "\"removed_external_sessions\":" << stats.removed_external_sessions << ",";
+    body << "\"last_run_epoch_ms\":" << stats.last_run_epoch_ms;
+    body << "}";
+    body << "}";
     return body.str();
 }
 

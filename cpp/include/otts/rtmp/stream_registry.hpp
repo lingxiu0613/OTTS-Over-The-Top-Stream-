@@ -93,6 +93,15 @@ public:
         std::string last_error;
     };
 
+    struct CleanupStats {
+        std::uint64_t runs{0};
+        std::uint64_t expired_subscribers{0};
+        std::uint64_t inactive_external_publishers{0};
+        std::uint64_t removed_streams{0};
+        std::uint64_t removed_external_sessions{0};
+        std::uint64_t last_run_epoch_ms{0};
+    };
+
     void register_publisher(const std::string& stream_key, const std::shared_ptr<RtmpSession>& session);
     void unregister_publisher(const std::shared_ptr<RtmpSession>& session);
     void add_subscriber(const std::string& stream_key, const std::shared_ptr<RtmpSession>& session);
@@ -142,6 +151,8 @@ public:
     std::size_t viewer_count(const std::string& stream_key);
     std::vector<StreamSnapshot> snapshots() const;
     std::vector<ExternalSessionSnapshot> external_sessions() const;
+    CleanupStats cleanup_stale(std::uint64_t external_publisher_idle_ms, std::uint64_t stopped_session_retention_ms);
+    CleanupStats cleanup_stats() const;
     std::optional<RtspDescribeInfo> rtsp_describe_info(const std::string& stream_key) const;
     bool disconnect_stream(const std::string& stream_key);
 
@@ -220,6 +231,7 @@ private:
     mutable std::mutex mutex_;
     std::unordered_map<std::string, StreamState> streams_;
     std::unordered_map<std::string, ExternalSessionState> external_sessions_;
+    CleanupStats cleanup_stats_;
 };
 
 }  // namespace otts::rtmp
