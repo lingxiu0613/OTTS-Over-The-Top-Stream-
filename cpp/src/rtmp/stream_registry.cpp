@@ -455,6 +455,7 @@ std::size_t StreamRegistry::viewer_count(const std::string& stream_key) {
 
 std::vector<StreamRegistry::StreamSnapshot> StreamRegistry::snapshots() const {
     std::lock_guard<std::mutex> lock(mutex_);
+    const auto now_ms = now_epoch_ms();
     std::vector<StreamSnapshot> result;
     result.reserve(streams_.size());
 
@@ -471,11 +472,20 @@ std::vector<StreamRegistry::StreamSnapshot> StreamRegistry::snapshots() const {
         snapshot.has_metadata = state.metadata.has_value();
         snapshot.has_audio_sequence_header = state.audio_sequence_header.has_value();
         snapshot.has_video_sequence_header = state.video_sequence_header.has_value();
+        snapshot.has_keyframe = state.last_keyframe_at_epoch_ms > 0;
+        snapshot.ready_for_play = snapshot.has_publisher && snapshot.has_video_sequence_header && snapshot.has_keyframe &&
+                                  state.gop_cache.size() > 0;
         snapshot.audio_codec = otts::media::to_string(state.audio_track.codec);
         snapshot.video_codec = otts::media::to_string(state.video_track.codec);
+        snapshot.track_count = (state.video_track.present ? 1U : 0U) + (state.audio_track.present ? 1U : 0U);
         snapshot.gop_cache_size = state.gop_cache.size();
         snapshot.total_packets = state.total_packets;
         snapshot.total_bytes = state.total_bytes;
+        if (state.first_media_at_epoch_ms > 0 && state.last_media_at_epoch_ms >= state.first_media_at_epoch_ms) {
+            const auto duration_ms = std::max<std::uint64_t>(1, state.last_media_at_epoch_ms - state.first_media_at_epoch_ms);
+            snapshot.average_packet_rate = (static_cast<double>(state.total_packets) * 1000.0) / static_cast<double>(duration_ms);
+            snapshot.average_bitrate_kbps = (static_cast<double>(state.total_bytes) * 8.0) / static_cast<double>(duration_ms);
+        }
         snapshot.audio_packets = state.audio_packets;
         snapshot.audio_bytes = state.audio_bytes;
         snapshot.video_packets = state.video_packets;
@@ -486,6 +496,9 @@ std::vector<StreamRegistry::StreamSnapshot> StreamRegistry::snapshots() const {
         snapshot.last_keyframe_at_epoch_ms = state.last_keyframe_at_epoch_ms;
         snapshot.first_media_at_epoch_ms = state.first_media_at_epoch_ms;
         snapshot.last_media_at_epoch_ms = state.last_media_at_epoch_ms;
+        if (state.last_media_at_epoch_ms > 0 && now_ms >= state.last_media_at_epoch_ms) {
+            snapshot.last_media_age_ms = now_ms - state.last_media_at_epoch_ms;
+        }
         result.push_back(std::move(snapshot));
     }
 
@@ -850,12 +863,30 @@ void StreamRegistry::persist_state_locked() const {
         file << "      \"has_metadata\": " << (state.metadata ? "true" : "false") << ",\n";
         file << "      \"has_audio_sequence_header\": " << (state.audio_sequence_header ? "true" : "false") << ",\n";
         file << "      \"has_video_sequence_header\": " << (state.video_sequence_header ? "true" : "false") << ",\n";
+        file << "      \"has_keyframe\": " << (state.last_keyframe_at_epoch_ms > 0 ? "true" : "false") << ",\n";
+        file << "      \"ready_for_play\": "
+             << ((!state.publisher.expired() || state.external_publisher_active) && state.video_sequence_header &&
+                         state.last_keyframe_at_epoch_ms > 0 && state.gop_cache.size() > 0
+                     ? "true"
+                     : "false")
+             << ",\n";
         file << "      \"gop_cache_size\": " << state.gop_cache.size() << ",\n";
         file << "      \"audio_codec\": \"" << otts::media::to_string(state.audio_track.codec) << "\",\n";
         file << "      \"video_codec\": \"" << otts::media::to_string(state.video_track.codec) << "\",\n";
+        file << "      \"track_count\": " << ((state.video_track.present ? 1U : 0U) + (state.audio_track.present ? 1U : 0U)) << ",\n";
         file << "      \"callback_subscriber_count\": " << state.callback_subscribers.size() << ",\n";
         file << "      \"total_packets\": " << state.total_packets << ",\n";
         file << "      \"total_bytes\": " << state.total_bytes << ",\n";
+        if (state.first_media_at_epoch_ms > 0 && state.last_media_at_epoch_ms >= state.first_media_at_epoch_ms) {
+            const auto duration_ms = std::max<std::uint64_t>(1, state.last_media_at_epoch_ms - state.first_media_at_epoch_ms);
+            file << "      \"average_packet_rate\": " << std::fixed << std::setprecision(2)
+                 << (static_cast<double>(state.total_packets) * 1000.0) / static_cast<double>(duration_ms) << ",\n";
+            file << "      \"average_bitrate_kbps\": " << std::fixed << std::setprecision(2)
+                 << (static_cast<double>(state.total_bytes) * 8.0) / static_cast<double>(duration_ms) << ",\n";
+        } else {
+            file << "      \"average_packet_rate\": 0.00,\n";
+            file << "      \"average_bitrate_kbps\": 0.00,\n";
+        }
         file << "      \"audio_packets\": " << state.audio_packets << ",\n";
         file << "      \"audio_bytes\": " << state.audio_bytes << ",\n";
         file << "      \"video_packets\": " << state.video_packets << ",\n";
@@ -865,7 +896,12 @@ void StreamRegistry::persist_state_locked() const {
         file << "      \"last_media_timestamp\": " << state.last_media_timestamp << ",\n";
         file << "      \"last_keyframe_at_epoch_ms\": " << state.last_keyframe_at_epoch_ms << ",\n";
         file << "      \"first_media_at_epoch_ms\": " << state.first_media_at_epoch_ms << ",\n";
-        file << "      \"last_media_at_epoch_ms\": " << state.last_media_at_epoch_ms << "\n";
+        file << "      \"last_media_at_epoch_ms\": " << state.last_media_at_epoch_ms << ",\n";
+        file << "      \"last_media_age_ms\": "
+             << (state.last_media_at_epoch_ms > 0 && now_epoch_ms() >= state.last_media_at_epoch_ms
+                     ? now_epoch_ms() - state.last_media_at_epoch_ms
+                     : 0)
+             << "\n";
         file << "    }";
     }
 

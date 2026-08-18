@@ -41,11 +41,16 @@ public:
         bool has_metadata{false};
         bool has_audio_sequence_header{false};
         bool has_video_sequence_header{false};
+        bool has_keyframe{false};
+        bool ready_for_play{false};
         std::string audio_codec;
         std::string video_codec;
+        std::size_t track_count{0};
         std::size_t gop_cache_size{0};
         std::uint64_t total_packets{0};
         std::uint64_t total_bytes{0};
+        double average_packet_rate{0.0};
+        double average_bitrate_kbps{0.0};
         std::uint64_t audio_packets{0};
         std::uint64_t audio_bytes{0};
         std::uint64_t video_packets{0};
@@ -56,6 +61,7 @@ public:
         std::uint64_t last_keyframe_at_epoch_ms{0};
         std::uint64_t first_media_at_epoch_ms{0};
         std::uint64_t last_media_at_epoch_ms{0};
+        std::uint64_t last_media_age_ms{0};
     };
 
     struct RtspDescribeInfo {

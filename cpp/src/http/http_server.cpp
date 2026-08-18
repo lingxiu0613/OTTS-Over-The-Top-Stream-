@@ -14,6 +14,7 @@
 #include <condition_variable>
 #include <deque>
 #include <cstring>
+#include <iomanip>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -879,11 +880,16 @@ std::string HttpServer::build_streams_json() const {
         body << "\"has_metadata\":" << (stream.has_metadata ? "true" : "false") << ",";
         body << "\"has_audio_sequence_header\":" << (stream.has_audio_sequence_header ? "true" : "false") << ",";
         body << "\"has_video_sequence_header\":" << (stream.has_video_sequence_header ? "true" : "false") << ",";
+        body << "\"has_keyframe\":" << (stream.has_keyframe ? "true" : "false") << ",";
+        body << "\"ready_for_play\":" << (stream.ready_for_play ? "true" : "false") << ",";
         body << "\"audio_codec\":\"" << stream.audio_codec << "\",";
         body << "\"video_codec\":\"" << stream.video_codec << "\",";
+        body << "\"track_count\":" << stream.track_count << ",";
         body << "\"gop_cache_size\":" << stream.gop_cache_size << ",";
         body << "\"total_packets\":" << stream.total_packets << ",";
         body << "\"total_bytes\":" << stream.total_bytes << ",";
+        body << "\"average_packet_rate\":" << std::fixed << std::setprecision(2) << stream.average_packet_rate << ",";
+        body << "\"average_bitrate_kbps\":" << std::fixed << std::setprecision(2) << stream.average_bitrate_kbps << ",";
         body << "\"audio_packets\":" << stream.audio_packets << ",";
         body << "\"audio_bytes\":" << stream.audio_bytes << ",";
         body << "\"video_packets\":" << stream.video_packets << ",";
@@ -893,7 +899,8 @@ std::string HttpServer::build_streams_json() const {
         body << "\"last_media_timestamp\":" << stream.last_media_timestamp << ",";
         body << "\"last_keyframe_at_epoch_ms\":" << stream.last_keyframe_at_epoch_ms << ",";
         body << "\"first_media_at_epoch_ms\":" << stream.first_media_at_epoch_ms << ",";
-        body << "\"last_media_at_epoch_ms\":" << stream.last_media_at_epoch_ms;
+        body << "\"last_media_at_epoch_ms\":" << stream.last_media_at_epoch_ms << ",";
+        body << "\"last_media_age_ms\":" << stream.last_media_age_ms;
         {
             std::lock_guard<std::mutex> stats_lock(flv_stats_mutex_);
             const auto stats_it = flv_stats_.find(stream.stream_key);
