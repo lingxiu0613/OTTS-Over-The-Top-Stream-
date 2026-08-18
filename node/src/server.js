@@ -5,6 +5,7 @@ import https from "https";
 import path from "path";
 import { fileURLToPath } from "url";
 import { HlsManager } from "./hls_manager.js";
+import { RecordingManager } from "./recording_manager.js";
 import { RtspCompatManager } from "./rtsp_compat_manager.js";
 import { RtspPlaybackServer } from "./rtsp_playback_server.js";
 import { RtspPublishServer } from "./rtsp_publish_server.js";
@@ -24,6 +25,11 @@ const tlsCertPath = process.env.OTTS_TLS_CERT_PATH || "";
 const hlsManager = new HlsManager({
   ffmpegBin: process.env.OTTS_FFMPEG_BIN || "ffmpeg",
   rtmpBase: process.env.OTTS_RTMP_BASE || "rtmp://127.0.0.1:1935"
+});
+const recordingManager = new RecordingManager({
+  ffmpegBin: process.env.OTTS_FFMPEG_BIN || "ffmpeg",
+  rtmpBase: process.env.OTTS_RTMP_BASE || "rtmp://127.0.0.1:1935",
+  rootDir: process.env.OTTS_RECORDING_ROOT || undefined
 });
 const rtspProxyManager = new RtspProxyManager({
   ffmpegBin: process.env.OTTS_FFMPEG_BIN || "ffmpeg",
@@ -45,7 +51,8 @@ const rtspPlaybackServer = new RtspPlaybackServer({
   publicHost: process.env.OTTS_RTSP_PUBLIC_HOST || "192.168.40.11",
   apiBase,
   rtmpBase: process.env.OTTS_RTMP_BASE || "rtmp://127.0.0.1:1935",
-  ffmpegBin: process.env.OTTS_FFMPEG_BIN || "ffmpeg"
+  ffmpegBin: process.env.OTTS_FFMPEG_BIN || "ffmpeg",
+  defaultPlayMode: process.env.OTTS_RTSP_PLAY_MODE || "core-egress-flv"
 });
 const rtspPublishServer = new RtspPublishServer({
   port: Number(process.env.OTTS_RTSP_PUBLISH_PORT || 8554),
@@ -53,7 +60,8 @@ const rtspPublishServer = new RtspPublishServer({
   publicHost: process.env.OTTS_RTSP_PUBLIC_HOST || "192.168.40.11",
   apiBase,
   rtmpBase: process.env.OTTS_RTMP_BASE || "rtmp://127.0.0.1:1935",
-  ffmpegBin: process.env.OTTS_FFMPEG_BIN || "ffmpeg"
+  ffmpegBin: process.env.OTTS_FFMPEG_BIN || "ffmpeg",
+  defaultPublishMode: process.env.OTTS_RTSP_PUBLISH_MODE || "core-direct-flv"
 });
 const srtManager = new SrtManager({
   ffmpegBin: process.env.OTTS_FFMPEG_BIN || "ffmpeg",
@@ -62,11 +70,14 @@ const srtManager = new SrtManager({
   publicHost: process.env.OTTS_SRT_PUBLIC_HOST || process.env.OTTS_RTSP_PUBLIC_HOST || "192.168.40.11",
   publishPortBase: Number(process.env.OTTS_SRT_PUBLISH_PORT_BASE || 9000),
   playPortBase: Number(process.env.OTTS_SRT_PLAY_PORT_BASE || 10000),
-  defaultPublishMode: process.env.OTTS_SRT_PUBLISH_MODE || "legacy-rtmp-loopback"
+  defaultPublishMode: process.env.OTTS_SRT_PUBLISH_MODE || "core-direct-flv",
+  defaultPlayMode: process.env.OTTS_SRT_PLAY_MODE || "core-egress-flv"
 });
 const srtBootstrapEnabled = (process.env.OTTS_SRT_BOOTSTRAP_ENABLED || "true") !== "false";
 const srtBootstrapStreamKey = process.env.OTTS_SRT_BOOTSTRAP_STREAM_KEY || "live/srt-demo";
 const srtBootstrapPlayEnabled = (process.env.OTTS_SRT_BOOTSTRAP_PLAY_ENABLED || "true") !== "false";
+const rtspPlaybackEnabled = (process.env.OTTS_RTSP_PLAY_COMPAT_ENABLED || "true") !== "false";
+const nativeProtocolOnly = (process.env.OTTS_NATIVE_PROTOCOL_ONLY || "true") !== "false";
 
 function buildStreamSummary(streams = []) {
   const summary = {
@@ -144,6 +155,25 @@ function mergeRtspCompatSessions(desiredSessions = [], publishSessions = []) {
   return [...merged.values()].sort((left, right) => left.stream_key.localeCompare(right.stream_key));
 }
 
+function encodeRtspPath(streamKey) {
+  return String(streamKey || "live/stream").replace(/\//g, "__");
+}
+
+function nativeRtspUrls(streamKey) {
+  const path = encodeRtspPath(streamKey);
+  return {
+    publish_url: `rtsp://${rtspPublishServer.publicHost}:${rtspPublishServer.port}/${path}.sdp`,
+    play_url: `rtsp://${rtspPlaybackServer.publicHost}:${rtspPlaybackServer.port}/${path}.sdp`
+  };
+}
+
+function nativeSrtUrls() {
+  return {
+    publish_url: `srt://${process.env.OTTS_SRT_PUBLIC_HOST || process.env.OTTS_RTSP_PUBLIC_HOST || "192.168.40.11"}:${Number(process.env.OTTS_SRT_PUBLISH_PORT_BASE || 9000)}?mode=caller&transtype=live`,
+    play_url: `srt://${process.env.OTTS_SRT_PUBLIC_HOST || process.env.OTTS_RTSP_PUBLIC_HOST || "192.168.40.11"}:${Number(process.env.OTTS_SRT_PLAY_PORT_BASE || 10000)}?mode=caller&transtype=live`
+  };
+}
+
 async function fetchJson(pathname, fallback) {
   try {
     const response = await fetch(`${apiBase}${pathname}`);
@@ -206,6 +236,20 @@ async function getSystemStatus() {
 
 async function fetchGatewayJson(pathname, fallback) {
   try {
+    const nativeState = await getWebRtcNativeStatus();
+    if (nativeState.selected_runtime === "native") {
+      if (pathname === "/api/streams") {
+        return await fetchJson("/api/webrtc/sessions", fallback);
+      }
+      if (pathname === "/health") {
+        return {
+          ok: true,
+          service: "otts-webrtc-native",
+          runtime: nativeState.selected_runtime,
+          media_engine_ready: nativeState.media_engine_ready
+        };
+      }
+    }
     const response = await fetch(`${webrtcGatewayBase}${pathname}`);
     if (!response.ok) {
       throw new Error(`gateway status ${response.status}`);
@@ -216,16 +260,60 @@ async function fetchGatewayJson(pathname, fallback) {
   }
 }
 
+async function getWebRtcNativeStatus() {
+  return fetchJson("/api/webrtc/native", {
+    ok: false,
+    selected_runtime: "gateway",
+    media_engine_ready: false
+  });
+}
+
+async function getWebRtcSignalBase() {
+  const nativeState = await getWebRtcNativeStatus();
+  return nativeState.selected_runtime === "native" ? apiBase : webrtcGatewayBase;
+}
+
+function requestTextBody(req) {
+  if (typeof req.rawBody === "string") {
+    return req.rawBody;
+  }
+  if (typeof req.body === "string") {
+    return req.body;
+  }
+  if (Buffer.isBuffer(req.body)) {
+    return req.body.toString("utf8");
+  }
+  if (req.body instanceof Uint8Array) {
+    return Buffer.from(req.body).toString("utf8");
+  }
+  return "";
+}
+
+async function readRequestTextBody(req) {
+  const parsed = requestTextBody(req);
+  if (parsed) {
+    return parsed;
+  }
+
+  const chunks = [];
+  for await (const chunk of req) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
 async function proxyWebRtcSdp(req, res, targetPath) {
   try {
     const queryIndex = req.originalUrl.indexOf("?");
     const query = queryIndex >= 0 ? req.originalUrl.slice(queryIndex) : "";
-    const response = await fetch(`${webrtcGatewayBase}${targetPath}${query}`, {
+    const body = await readRequestTextBody(req);
+    const targetBase = await getWebRtcSignalBase();
+    const response = await fetch(`${targetBase}${targetPath}${query}`, {
       method: "POST",
       headers: {
         "Content-Type": req.get("content-type") || "application/sdp"
       },
-      body: typeof req.body === "string" ? req.body : ""
+      body
     });
 
     const text = await response.text();
@@ -249,13 +337,95 @@ async function proxyWebRtcSdp(req, res, targetPath) {
   }
 }
 
+async function proxyWebRtcOffer(req, res, targetPath) {
+  try {
+    const queryIndex = req.originalUrl.indexOf("?");
+    const query = queryIndex >= 0 ? req.originalUrl.slice(queryIndex) : "";
+    const targetBase = await getWebRtcSignalBase();
+    const response = await fetch(`${targetBase}${targetPath}${query}`, {
+      method: "GET"
+    });
+
+    const text = await response.text();
+    const contentType = response.headers.get("content-type") || "application/sdp";
+    const location = response.headers.get("location");
+    const sessionId = response.headers.get("x-session-id");
+    if (location) {
+      res.setHeader("Location", location);
+    }
+    if (sessionId) {
+      res.setHeader("X-Session-Id", sessionId);
+    }
+    res.status(response.status);
+    res.type(contentType);
+    res.send(text);
+  } catch (error) {
+    res.status(502).json({
+      ok: false,
+      error: error instanceof Error ? error.message : "webrtc native offer unavailable"
+    });
+  }
+}
+
+async function proxyWebRtcSession(req, res) {
+  try {
+    const targetBase = await getWebRtcSignalBase();
+    const body = req.method === "PATCH" || req.method === "POST" ? await readRequestTextBody(req) : undefined;
+    const response = await fetch(`${targetBase}${req.originalUrl}`, {
+      method: req.method,
+      headers: {
+        "Content-Type": req.get("content-type") || "text/plain"
+      },
+      body
+    });
+    const text = await response.text();
+    res.status(response.status);
+    const contentType = response.headers.get("content-type");
+    if (contentType) {
+      res.type(contentType);
+    }
+    res.send(text);
+  } catch (error) {
+    res.status(502).json({
+      ok: false,
+      error: error instanceof Error ? error.message : "webrtc gateway unavailable"
+    });
+  }
+}
+
 function proxyAlias(req, res, targetPath) {
   return proxyWebRtcSdp(req, res, targetPath);
 }
 
-app.use(express.text({ type: ["application/sdp", "text/plain"], limit: "10mb" }));
+function isWebRtcSignalRequest(req) {
+  return (
+    req.path.startsWith("/whip") ||
+    req.path.startsWith("/whep") ||
+    req.path.startsWith("/rtc/v1/whip") ||
+    req.path.startsWith("/rtc/v1/whep") ||
+    (req.path.startsWith("/session/") && (req.method === "PATCH" || req.method === "POST"))
+  );
+}
+
+app.use((req, _res, next) => {
+  if (!isWebRtcSignalRequest(req)) {
+    next();
+    return;
+  }
+  const chunks = [];
+  req.on("data", (chunk) => {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  });
+  req.on("end", () => {
+    req.rawBody = Buffer.concat(chunks).toString("utf8");
+    next();
+  });
+  req.on("error", next);
+});
 app.use(express.json());
 app.use(express.static(path.join(__dirname, "..", "web")));
+app.use("/recordings", express.static(recordingManager.rootDir));
+
 app.use("/hls", express.static(hlsManager.rootDir, {
   fallthrough: true,
   setHeaders(res, filePath) {
@@ -288,8 +458,11 @@ app.get("/api/health", async (_req, res) => {
   const managedProcesses = systemStatus.managed_processes || [];
   const managedOnline = managedProcesses.filter((process) => process.running).length;
   const rtspPublishSessions = rtspPublishServer.sessionSummaries();
-  const rtspCompatSessions = rtspCompatManager.listStatuses();
-  const srtSessions = srtManager.listStatuses();
+  const rtspCompatSessions = nativeProtocolOnly ? [] : rtspCompatManager.listStatuses();
+  const protocolSessions = await getProtocolSessions();
+  const nativeSrtSessions = (protocolSessions.sessions || [])
+    .filter((session) => session.source_protocol === "srt" && String(session.managed_by || "").startsWith("cpp-srt-"));
+  const srtSessions = nativeProtocolOnly ? nativeSrtSessions : srtManager.listStatuses();
   res.json({
     ...health,
     streamCount: streamList.length,
@@ -312,6 +485,7 @@ app.get("/api/health", async (_req, res) => {
     srtPublishRunningCount: srtSessions.filter((session) => session.publish?.running).length,
     srtPlayCount: srtSessions.filter((session) => session.desired_play).length,
     srtPlayRunningCount: srtSessions.filter((session) => session.play?.running).length,
+    recordingRunningCount: recordingManager.listStatuses(streamList).filter((item) => item.running).length,
     streamSummary
   });
 });
@@ -321,7 +495,8 @@ app.get("/api/streams", async (_req, res) => {
   await hlsManager.syncStreams(state.streams || []);
   const enriched = (state.streams || []).map((stream) => ({
     ...stream,
-    hls: hlsManager.getStatus(stream.stream_key)
+    hls: hlsManager.getStatus(stream.stream_key),
+    recording: recordingManager.getStatus(stream.stream_key)
   }));
   res.json({ streams: enriched });
 });
@@ -329,6 +504,58 @@ app.get("/api/streams", async (_req, res) => {
 app.get("/api/protocol/sessions", async (_req, res) => {
   const state = await getProtocolSessions();
   res.json(state);
+});
+
+app.get("/api/recordings", async (_req, res) => {
+  const files = await recordingManager.listFiles();
+  res.json({ ok: true, root_dir: recordingManager.rootDir, files });
+});
+
+app.get("/api/recordings/status", async (req, res) => {
+  const streamKey = String(req.query.stream_key || "");
+  if (!streamKey) {
+    res.status(400).json({ ok: false, error: "missing stream_key" });
+    return;
+  }
+  res.json({ ok: true, recording: recordingManager.getStatus(streamKey) });
+});
+
+app.post("/api/recordings/start", async (req, res) => {
+  const streamKey = String(req.query.stream_key || "");
+  const format = String(req.query.format || "flv");
+  if (!streamKey) {
+    res.status(400).json({ ok: false, error: "missing stream_key" });
+    return;
+  }
+  try {
+    const status = await recordingManager.start(streamKey, { format });
+    res.json({ ok: true, recording: status });
+  } catch (error) {
+    res.status(400).json({
+      ok: false,
+      error: error instanceof Error ? error.message : "failed to start recording"
+    });
+  }
+});
+
+app.post("/api/recordings/stop", async (req, res) => {
+  const streamKey = String(req.query.stream_key || "");
+  if (!streamKey) {
+    res.status(400).json({ ok: false, error: "missing stream_key" });
+    return;
+  }
+  const status = await recordingManager.stop(streamKey);
+  res.json({ ok: Boolean(status), recording: status });
+});
+
+app.get("/api/recordings/log", async (req, res) => {
+  const streamKey = String(req.query.stream_key || "");
+  if (!streamKey) {
+    res.status(400).json({ ok: false, error: "missing stream_key" });
+    return;
+  }
+  const lines = await recordingManager.readLogTail(streamKey);
+  res.json({ ok: true, lines });
 });
 
 app.get("/api/webrtc/sessions", async (_req, res) => {
@@ -344,24 +571,76 @@ app.get("/api/webrtc/health", async (_req, res) => {
   res.json(state);
 });
 
+app.get("/api/webrtc/native", async (_req, res) => {
+  const state = await getWebRtcNativeStatus();
+  res.json({
+    ok: false,
+    mode: "unknown",
+    selected_runtime: "unknown",
+    compiled_with_dependency: false,
+    dependency_ready: false,
+    media_engine_ready: false,
+    detail: "core API unavailable",
+    ...state
+  });
+});
+
+app.get("/api/webrtc/native/raw", async (_req, res) => {
+  const state = await fetchJson("/api/webrtc/native", {
+    ok: false,
+    mode: "unknown",
+    selected_runtime: "unknown",
+    compiled_with_dependency: false,
+    dependency_ready: false,
+    media_engine_ready: false,
+    detail: "core API unavailable"
+  });
+  res.json(state);
+});
+
 app.get("/api/system/status", async (_req, res) => {
   const systemStatus = await getSystemStatus();
   res.json(systemStatus);
 });
 
 app.get("/api/rtsp/proxies", async (_req, res) => {
-  res.json({ proxies: rtspProxyManager.listStatuses() });
+  res.json({
+    native_only: nativeProtocolOnly,
+    disabled: nativeProtocolOnly,
+    proxies: nativeProtocolOnly ? [] : rtspProxyManager.listStatuses()
+  });
 });
 
 app.get("/api/rtsp/compat", async (_req, res) => {
-  const desiredSessions = rtspCompatManager.listStatuses();
-  const publishSessions = rtspPublishServer.sessionSummaries();
-  const playbackSessions = rtspPlaybackServer.sessionSummaries();
+  const desiredSessions = nativeProtocolOnly ? [] : rtspCompatManager.listStatuses();
+  const protocolSessions = await getProtocolSessions();
+  const nativeSessions = (protocolSessions.sessions || [])
+    .filter((session) => session.source_protocol === "rtsp" && String(session.managed_by || "").startsWith("cpp-rtsp-"));
+  const publishSessions = nativeProtocolOnly
+    ? nativeSessions.filter((session) => session.direction === "publish")
+    : rtspPublishServer.sessionSummaries();
+  const playbackSessions = nativeProtocolOnly
+    ? nativeSessions.filter((session) => session.direction === "play")
+    : (rtspPlaybackEnabled ? rtspPlaybackServer.sessionSummaries() : []);
+  const mergedSessions = nativeProtocolOnly
+    ? publishSessions.map((session) => ({
+        stream_key: session.stream_key,
+        ...nativeRtspUrls(session.stream_key),
+        desired_publish: true,
+        desired_play: true,
+        publish: null,
+        play: null,
+        native_publish: session
+      }))
+    : mergeRtspCompatSessions(desiredSessions, publishSessions);
   res.json({
+    native_only: nativeProtocolOnly,
+    disabled: nativeProtocolOnly,
     sessions: desiredSessions,
     publish_sessions: publishSessions,
     playback_sessions: playbackSessions,
-    merged_sessions: mergeRtspCompatSessions(desiredSessions, publishSessions),
+    native_sessions: nativeSessions,
+    merged_sessions: mergedSessions,
     summary: {
       ...buildSessionSummary(desiredSessions),
       desired_count: desiredSessions.length,
@@ -373,19 +652,38 @@ app.get("/api/rtsp/compat", async (_req, res) => {
 });
 
 app.get("/api/srt/sessions", async (_req, res) => {
-  const sessions = srtManager.listStatuses();
+  const sessions = nativeProtocolOnly ? [] : srtManager.listStatuses();
+  const protocolSessions = await getProtocolSessions();
+  const nativeSessions = (protocolSessions.sessions || [])
+    .filter((session) => session.source_protocol === "srt" && String(session.managed_by || "").startsWith("cpp-srt-"));
+  const nativeUrls = nativeSrtUrls();
   res.json({
+    native_only: nativeProtocolOnly,
+    disabled: nativeProtocolOnly,
+    urls: nativeUrls,
     sessions,
+    native_sessions: nativeSessions,
     summary: {
       ...buildSessionSummary(sessions),
-      total_count: sessions.length,
+      total_count: nativeProtocolOnly ? nativeSessions.length : sessions.length,
       publish_count: sessions.filter((session) => session.desired_publish).length,
-      play_count: sessions.filter((session) => session.desired_play).length
+      play_count: sessions.filter((session) => session.desired_play).length,
+      native_count: nativeSessions.length,
+      native_publish_count: nativeSessions.filter((session) => session.direction === "publish").length,
+      native_play_count: nativeSessions.filter((session) => session.direction === "play").length
     }
   });
 });
 
 app.post("/api/srt/start", async (req, res) => {
+  if (nativeProtocolOnly) {
+    res.status(410).json({
+      ok: false,
+      error: "SRT ffmpeg compatibility workers are disabled; use the native C++ SRT publish/play ports directly",
+      urls: nativeSrtUrls()
+    });
+    return;
+  }
   const streamKey = String(req.query.stream_key || "");
   const mode = String(req.query.mode || "both");
   if (!streamKey) {
@@ -410,6 +708,10 @@ app.post("/api/srt/start", async (req, res) => {
 });
 
 app.post("/api/srt/stop", async (req, res) => {
+  if (nativeProtocolOnly) {
+    res.json({ ok: true, disabled: true, message: "SRT native path has no Node worker to stop" });
+    return;
+  }
   const streamKey = String(req.query.stream_key || "");
   const mode = String(req.query.mode || "both");
   if (!streamKey) {
@@ -421,6 +723,10 @@ app.post("/api/srt/stop", async (req, res) => {
 });
 
 app.get("/api/srt/log", async (req, res) => {
+  if (nativeProtocolOnly) {
+    res.json({ ok: true, disabled: true, lines: ["SRT native path is handled by the C++ core; see OTTS runtime log."] });
+    return;
+  }
   const streamKey = String(req.query.stream_key || "");
   const mode = String(req.query.mode || "publish");
   if (!streamKey) {
@@ -432,6 +738,13 @@ app.get("/api/srt/log", async (req, res) => {
 });
 
 app.post("/api/rtsp/proxies/start", async (req, res) => {
+  if (nativeProtocolOnly) {
+    res.status(410).json({
+      ok: false,
+      error: "RTSP pull relay compatibility workers are disabled in native protocol mode"
+    });
+    return;
+  }
   try {
     const status = await rtspProxyManager.start({
       streamKey: String(req.query.stream_key || ""),
@@ -448,6 +761,10 @@ app.post("/api/rtsp/proxies/start", async (req, res) => {
 });
 
 app.post("/api/rtsp/proxies/stop", async (req, res) => {
+  if (nativeProtocolOnly) {
+    res.json({ ok: true, disabled: true, message: "RTSP pull relay compatibility worker is disabled" });
+    return;
+  }
   const streamKey = String(req.query.stream_key || "");
   if (!streamKey) {
     res.status(400).json({ ok: false, error: "missing stream_key" });
@@ -459,6 +776,10 @@ app.post("/api/rtsp/proxies/stop", async (req, res) => {
 });
 
 app.get("/api/rtsp/proxies/log", async (req, res) => {
+  if (nativeProtocolOnly) {
+    res.json({ ok: true, disabled: true, lines: ["RTSP pull relay compatibility worker is disabled in native protocol mode."] });
+    return;
+  }
   const streamKey = String(req.query.stream_key || "");
   if (!streamKey) {
     res.status(400).json({ ok: false, error: "missing stream_key" });
@@ -470,6 +791,15 @@ app.get("/api/rtsp/proxies/log", async (req, res) => {
 });
 
 app.post("/api/rtsp/compat/start", async (req, res) => {
+  if (nativeProtocolOnly) {
+    const streamKey = String(req.query.stream_key || "live/rtsp-demo");
+    res.status(410).json({
+      ok: false,
+      error: "RTSP ffmpeg compatibility workers are disabled; use native RTSP publish/play endpoints directly",
+      ...nativeRtspUrls(streamKey)
+    });
+    return;
+  }
   const streamKey = String(req.query.stream_key || "");
   const mode = String(req.query.mode || "both");
   if (!streamKey) {
@@ -495,6 +825,10 @@ app.post("/api/rtsp/compat/start", async (req, res) => {
 });
 
 app.post("/api/rtsp/compat/stop", async (req, res) => {
+  if (nativeProtocolOnly) {
+    res.json({ ok: true, disabled: true, message: "RTSP native path has no compatibility worker to stop" });
+    return;
+  }
   const streamKey = String(req.query.stream_key || "");
   const mode = String(req.query.mode || "both");
   if (!streamKey) {
@@ -507,6 +841,10 @@ app.post("/api/rtsp/compat/stop", async (req, res) => {
 });
 
 app.get("/api/rtsp/compat/log", async (req, res) => {
+  if (nativeProtocolOnly) {
+    res.json({ ok: true, disabled: true, lines: ["RTSP native path is handled by the C++ core/RTSP ingress; see OTTS runtime log."] });
+    return;
+  }
   const streamKey = String(req.query.stream_key || "");
   const mode = String(req.query.mode || "publish");
   if (!streamKey) {
@@ -536,6 +874,11 @@ app.post("/whep", async (req, res) => proxyAlias(req, res, "/whep"));
 app.post("/whep/v1", async (req, res) => proxyAlias(req, res, "/whep/v1"));
 app.post("/rtc/v1/whep", async (req, res) => proxyAlias(req, res, "/whep/v1"));
 app.post("/rtc/v1/whep/", async (req, res) => proxyAlias(req, res, "/whep/v1"));
+app.get("/whep/offer/v1", async (req, res) => proxyWebRtcOffer(req, res, "/whep/offer/v1"));
+app.get("/rtc/v1/whep/offer", async (req, res) => proxyWebRtcOffer(req, res, "/whep/offer/v1"));
+app.patch("/session/:sessionId", async (req, res) => proxyWebRtcSession(req, res));
+app.post("/session/:sessionId/answer", async (req, res) => proxyWebRtcSession(req, res));
+app.delete("/session/:sessionId", async (req, res) => proxyWebRtcSession(req, res));
 
 app.post("/api/streams/disconnect", async (req, res) => {
   const streamKey = req.query.stream_key;
@@ -579,6 +922,11 @@ app.post("/api/streams/hls/stop", async (req, res) => {
   res.json({ ok: stopped, hls: hlsManager.getStatus(String(streamKey)) });
 });
 
+app.post("/api/streams/hls/cleanup", async (_req, res) => {
+  const removed = await hlsManager.cleanupStaleOutputsWithReport(false);
+  res.json({ ok: true, removed });
+});
+
 app.get("/api/streams/hls/log", async (req, res) => {
   const streamKey = req.query.stream_key;
   if (!streamKey) {
@@ -604,8 +952,16 @@ http.createServer(app).listen(port, () => {
   console.log(`OTTS control plane listening on http://0.0.0.0:${port}`);
 });
 
-rtspPublishServer.start();
-rtspPlaybackServer.start();
+if (!nativeProtocolOnly) {
+  rtspPublishServer.start();
+} else {
+  console.log("OTTS RTSP compatibility publish disabled; C++ native RTSP publish owns the publish port.");
+}
+if (!nativeProtocolOnly && rtspPlaybackEnabled) {
+  rtspPlaybackServer.start();
+} else {
+  console.log("OTTS RTSP compatibility playback disabled; C++ native RTSP play owns the play port.");
+}
 
 if (tlsKeyPath && tlsCertPath) {
   try {
@@ -626,7 +982,7 @@ setInterval(async () => {
   await hlsManager.syncStreams(state.streams || []);
 }, 5000);
 
-if (srtBootstrapEnabled && srtBootstrapStreamKey) {
+if (!nativeProtocolOnly && srtBootstrapEnabled && srtBootstrapStreamKey) {
   setTimeout(async () => {
     try {
       await ensureSrtBootstrap();

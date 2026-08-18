@@ -33,11 +33,17 @@ private:
     void handle_flv_request(int client_fd, const std::string& request_path);
     std::string make_json_response(const std::string& body, const std::string& status = "200 OK") const;
     std::string make_text_response(const std::string& body, const std::string& status) const;
+    std::string make_sdp_response(
+        const std::string& body,
+        const std::string& session_id,
+        const std::string& forwarded_host,
+        const std::string& status = "201 Created") const;
     std::string build_streams_json() const;
     std::string build_protocol_sessions_json() const;
     bool handle_disconnect_request(const std::string& request_path);
     std::string build_flv_stats_json() const;
     std::string build_webrtc_sessions_json() const;
+    std::string build_webrtc_native_json() const;
     std::optional<std::string> extract_query_param(const std::string& request_path, const std::string& key) const;
     std::string extract_request_body(const std::string& request) const;
     std::string handle_whip_request(
@@ -48,6 +54,7 @@ private:
         const std::string& request_path,
         const std::string& request_body,
         const std::string& forwarded_host);
+    std::optional<std::string> extract_webrtc_stream_key(const std::string& request_path) const;
     std::string handle_webrtc_session_request(
         const std::string& method,
         const std::string& request_path,

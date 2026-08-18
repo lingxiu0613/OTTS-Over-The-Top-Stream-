@@ -3,6 +3,7 @@ import fsp from "fs/promises";
 import os from "os";
 import path from "path";
 import { spawn } from "child_process";
+import { buildRtmpUrl } from "./rtmp_url.js";
 import { URLSearchParams } from "url";
 
 async function readTail(filePath, maxLines = 80) {
@@ -37,6 +38,10 @@ export class RtspProxyManager {
 
   targetUrl(streamKey) {
     return `${this.rtmpBase}/${streamKey}`;
+  }
+
+  internalTargetUrl(streamKey) {
+    return buildRtmpUrl(this.rtmpBase, streamKey, "publish");
   }
 
   getStatus(streamKey) {
@@ -110,6 +115,7 @@ export class RtspProxyManager {
     const logPath = this.logPath(normalizedKey);
     const logStream = fs.createWriteStream(logPath, { flags: "a" });
     const targetUrl = this.targetUrl(normalizedKey);
+    const internalTargetUrl = this.internalTargetUrl(normalizedKey);
     const child = spawn(
       this.ffmpegBin,
       [
@@ -124,7 +130,7 @@ export class RtspProxyManager {
         "copy",
         "-f",
         "flv",
-        targetUrl
+        internalTargetUrl
       ],
       { stdio: ["ignore", "pipe", "pipe"] }
     );

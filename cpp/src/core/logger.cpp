@@ -1,6 +1,9 @@
 #include "otts/core/logger.hpp"
 
+#include <algorithm>
 #include <chrono>
+#include <cctype>
+#include <cstdlib>
 #include <ctime>
 #include <fcntl.h>
 #include <iomanip>
@@ -26,15 +29,54 @@ const char* to_string(Logger::Level level) {
     return "UNKNOWN";
 }
 
+Logger::Level parse_level(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    if (value == "debug") {
+        return Logger::Level::Debug;
+    }
+    if (value == "warn" || value == "warning") {
+        return Logger::Level::Warn;
+    }
+    if (value == "error") {
+        return Logger::Level::Error;
+    }
+    return Logger::Level::Info;
+}
+
+Logger::Level configured_level() {
+    const char* value = std::getenv("OTTS_LOG_LEVEL");
+    return value == nullptr ? Logger::Level::Info : parse_level(value);
+}
+
 }  // namespace
 
 Logger& Logger::instance() {
     static Logger logger;
+    static bool initialized = false;
+    if (!initialized) {
+        logger.set_level(configured_level());
+        initialized = true;
+    }
     return logger;
+}
+
+void Logger::set_level(Level level) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    threshold_ = level;
+}
+
+Logger::Level Logger::level() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return threshold_;
 }
 
 void Logger::log(Level level, const std::string& component, const std::string& message) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (static_cast<int>(level) < static_cast<int>(threshold_)) {
+        return;
+    }
 
     const auto now = std::chrono::system_clock::now();
     const auto time = std::chrono::system_clock::to_time_t(now);

@@ -1,6 +1,10 @@
 build/
+build-*/
+build-native*/
 
 node/node_modules/
+__pycache__/
+*.pyc
 
 *.out
 *.err
@@ -9,8 +13,12 @@ node/node_modules/
 
 *.zip
 *.tar.gz
+*.tar.xz
 
 news_1280x720.mp4
+
+config/otts.env
+third_party/
 
 tmp_remote_*
 tmp_ssh_askpass.bat

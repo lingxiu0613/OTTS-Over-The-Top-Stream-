@@ -25,6 +25,7 @@ enum class StreamSource {
     Unknown,
     Rtmp,
     Whip,
+    Whep,
     Rtsp,
     Srt
 };
@@ -100,6 +101,8 @@ inline std::string to_string(StreamSource source) {
             return "rtmp";
         case StreamSource::Whip:
             return "whip";
+        case StreamSource::Whep:
+            return "whep";
         case StreamSource::Rtsp:
             return "rtsp";
         case StreamSource::Srt:

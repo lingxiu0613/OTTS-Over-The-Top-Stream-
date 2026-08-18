@@ -131,10 +131,13 @@ std::size_t parse_content_length(const std::string& request) {
         if (!line.empty() && line.back() == '\r') {
             line.pop_back();
         }
-        constexpr std::string_view prefix = "Content-Length:";
-        if (line.rfind(prefix, 0) == 0) {
+        const auto colon_pos = line.find(':');
+        if (colon_pos == std::string::npos) {
+            continue;
+        }
+        if (to_lower_copy(line.substr(0, colon_pos)) == "content-length") {
             try {
-                return static_cast<std::size_t>(std::stoul(line.substr(prefix.size())));
+                return static_cast<std::size_t>(std::stoul(line.substr(colon_pos + 1)));
             } catch (...) {
                 return 0;
             }
@@ -460,6 +463,10 @@ std::string HttpServer::handle_request(const std::string& request) {
         return make_json_response(build_webrtc_sessions_json());
     }
 
+    if (method == "GET" && path == "/api/webrtc/native") {
+        return make_json_response(build_webrtc_native_json());
+    }
+
     if (method == "GET" && path == "/api/debug/flv") {
         return make_json_response(build_flv_stats_json());
     }
@@ -526,6 +533,10 @@ std::string HttpServer::handle_request(const std::string& request) {
         const auto public_url = extract_query_param(path, "public_url").value_or("");
         const auto bind_url = extract_query_param(path, "bind_url").value_or("");
         const auto target_url = extract_query_param(path, "target_url").value_or("");
+        const auto transport = extract_query_param(path, "transport").value_or("");
+        const auto media_path = extract_query_param(path, "media_path").value_or("");
+        const auto native_stage = extract_query_param(path, "native_stage").value_or("");
+        const auto codec_hint = extract_query_param(path, "codec_hint").value_or("");
         const auto pid_text = extract_query_param(path, "pid").value_or("0");
         const auto started_text = extract_query_param(path, "started_at_epoch_ms").value_or("0");
         const auto stopped_text = extract_query_param(path, "last_stopped_at_epoch_ms").value_or("0");
@@ -555,6 +566,10 @@ std::string HttpServer::handle_request(const std::string& request) {
             public_url,
             bind_url,
             target_url,
+            transport,
+            media_path,
+            native_stage,
+            codec_hint,
             pid,
             started_at_epoch_ms,
             last_stopped_at_epoch_ms,
@@ -613,6 +628,26 @@ std::string HttpServer::handle_request(const std::string& request) {
         path.rfind("/session/", 0) == 0 || path.rfind("/resource/", 0) == 0) {
         log_webrtc_request_debug(method, path, request, body);
     }
+    if (method == "GET" &&
+        (path.rfind("/whep/offer/v1", 0) == 0 || path.rfind("/rtc/v1/whep/offer", 0) == 0)) {
+        const auto stream_key = extract_webrtc_stream_key(path);
+        if (!stream_key || stream_key->empty()) {
+            return make_json_response("{\"ok\":false,\"error\":\"missing stream_key\"}", "400 Bad Request");
+        }
+        if (webrtc_service_.should_use_gateway()) {
+            return make_json_response(
+                "{\"ok\":false,\"error\":\"native WebRTC runtime is not selected\"}",
+                "409 Conflict");
+        }
+        const auto result = webrtc_service_.create_native_play_offer(*stream_key);
+        if (!result.ok) {
+            return make_json_response(
+                std::string("{\"ok\":false,\"error\":\"") + result.error + "\"}",
+                "500 Internal Server Error");
+        }
+        return make_sdp_response(result.answer_sdp, result.session_id, forwarded_host);
+    }
+
     if (method == "POST" &&
         (path.rfind("/whip", 0) == 0 || path.rfind("/rtc/v1/whip", 0) == 0)) {
         return handle_whip_request(path, body, forwarded_host);
@@ -623,7 +658,7 @@ std::string HttpServer::handle_request(const std::string& request) {
         return handle_whep_request(path, body, forwarded_host);
     }
 
-    if ((method == "PATCH" || method == "DELETE") &&
+    if ((method == "PATCH" || method == "POST" || method == "DELETE") &&
         (path.rfind("/session/", 0) == 0 || path.rfind("/resource/", 0) == 0)) {
         return handle_webrtc_session_request(method, path, body, forwarded_host);
     }
@@ -773,6 +808,25 @@ std::string HttpServer::make_text_response(const std::string& body, const std::s
     return response.str();
 }
 
+std::string HttpServer::make_sdp_response(
+    const std::string& body,
+    const std::string& session_id,
+    const std::string& forwarded_host,
+    const std::string& status) const {
+    const auto host = forwarded_host.empty() ? std::string("127.0.0.1:") + std::to_string(port_) : forwarded_host;
+    std::ostringstream response;
+    response << "HTTP/1.1 " << status << "\r\n";
+    response << "Content-Type: application/sdp\r\n";
+    response << "Location: /session/" << session_id << "\r\n";
+    response << "Access-Control-Allow-Origin: *\r\n";
+    response << "Access-Control-Expose-Headers: Location\r\n";
+    response << "X-OTTS-Session-URL: http://" << host << "/session/" << session_id << "\r\n";
+    response << "Content-Length: " << body.size() << "\r\n";
+    response << "Connection: close\r\n\r\n";
+    response << body;
+    return response.str();
+}
+
 std::string HttpServer::build_streams_json() const {
     const auto streams = registry_.snapshots();
     std::ostringstream body;
@@ -911,11 +965,45 @@ std::string HttpServer::build_webrtc_sessions_json() const {
         body << "\"answer_size\":" << session.answer_size << ",";
         body << "\"created_at_epoch_ms\":" << session.created_at_epoch_ms << ",";
         body << "\"updated_at_epoch_ms\":" << session.updated_at_epoch_ms << ",";
+        body << "\"transport_state\":\"" << session.transport_state << "\",";
+        body << "\"video_frames\":" << session.video_frames << ",";
+        body << "\"video_bytes\":" << session.video_bytes << ",";
+        body << "\"audio_frames\":" << session.audio_frames << ",";
+        body << "\"audio_bytes\":" << session.audio_bytes << ",";
         body << "\"last_error\":\"" << session.last_error << "\"";
         body << "}";
     }
 
     body << "]}";
+    return body.str();
+}
+
+std::string HttpServer::build_webrtc_native_json() const {
+    const auto status = webrtc_service_.native_status();
+    auto mode_to_string = [](otts::webrtc::RuntimeMode mode) {
+        switch (mode) {
+            case otts::webrtc::RuntimeMode::Gateway:
+                return "gateway";
+            case otts::webrtc::RuntimeMode::Auto:
+                return "auto";
+            case otts::webrtc::RuntimeMode::Native:
+                return "native";
+        }
+        return "gateway";
+    };
+
+    std::ostringstream body;
+    body << "{";
+    body << "\"ok\":true,";
+    body << "\"mode\":\"" << mode_to_string(status.configured_mode) << "\",";
+    body << "\"selected_runtime\":\"" << status.selected_runtime << "\",";
+    body << "\"compiled_with_dependency\":" << (status.compiled_with_dependency ? "true" : "false") << ",";
+    body << "\"dependency_ready\":" << (status.dependency_ready ? "true" : "false") << ",";
+    body << "\"peer_factory_ready\":" << (status.peer_factory_ready ? "true" : "false") << ",";
+    body << "\"media_engine_ready\":" << (status.media_engine_ready ? "true" : "false") << ",";
+    body << "\"dependency_root\":\"" << status.dependency_root << "\",";
+    body << "\"detail\":\"" << status.detail << "\"";
+    body << "}";
     return body.str();
 }
 
@@ -977,6 +1065,22 @@ std::string HttpServer::handle_whip_request(
     const std::string& request_path,
     const std::string& request_body,
     const std::string& forwarded_host) {
+    if (!webrtc_service_.should_use_gateway()) {
+        const auto stream_key = extract_webrtc_stream_key(request_path);
+        if (!stream_key || stream_key->empty()) {
+            return make_json_response("{\"ok\":false,\"error\":\"missing stream_key\"}", "400 Bad Request");
+        }
+        const auto result = webrtc_service_.handle_native_offer(
+            otts::webrtc::SessionDirection::Publish,
+            *stream_key,
+            request_body);
+        if (!result.ok) {
+            return make_json_response(
+                std::string("{\"ok\":false,\"error\":\"") + result.error + "\"}",
+                "500 Internal Server Error");
+        }
+        return make_sdp_response(result.answer_sdp, result.session_id, forwarded_host);
+    }
     if (request_path.rfind("/rtc/v1/whip", 0) == 0) {
         auto mapped = std::string("/whip/v1");
         const auto query_pos = request_path.find('?');
@@ -992,6 +1096,22 @@ std::string HttpServer::handle_whep_request(
     const std::string& request_path,
     const std::string& request_body,
     const std::string& forwarded_host) {
+    if (!webrtc_service_.should_use_gateway()) {
+        const auto stream_key = extract_webrtc_stream_key(request_path);
+        if (!stream_key || stream_key->empty()) {
+            return make_json_response("{\"ok\":false,\"error\":\"missing stream_key\"}", "400 Bad Request");
+        }
+        const auto result = webrtc_service_.handle_native_offer(
+            otts::webrtc::SessionDirection::Play,
+            *stream_key,
+            request_body);
+        if (!result.ok) {
+            return make_json_response(
+                std::string("{\"ok\":false,\"error\":\"") + result.error + "\"}",
+                "500 Internal Server Error");
+        }
+        return make_sdp_response(result.answer_sdp, result.session_id, forwarded_host);
+    }
     if (request_path.rfind("/rtc/v1/whep", 0) == 0) {
         auto mapped = std::string("/whep/v1");
         const auto query_pos = request_path.find('?');
@@ -1003,11 +1123,52 @@ std::string HttpServer::handle_whep_request(
     return proxy_webrtc_request("POST", request_path, request_body, "application/sdp", forwarded_host);
 }
 
+std::optional<std::string> HttpServer::extract_webrtc_stream_key(const std::string& request_path) const {
+    if (auto stream_key = extract_query_param(request_path, "stream_key")) {
+        return stream_key;
+    }
+    const auto app = extract_query_param(request_path, "app");
+    const auto stream = extract_query_param(request_path, "stream");
+    if (app && stream && !app->empty() && !stream->empty()) {
+        return *app + "/" + *stream;
+    }
+    return std::nullopt;
+}
+
 std::string HttpServer::handle_webrtc_session_request(
     const std::string& method,
     const std::string& request_path,
     const std::string& request_body,
     const std::string& forwarded_host) {
+    if (!webrtc_service_.should_use_gateway()) {
+        if (method == "POST" && request_path.rfind("/session/", 0) == 0) {
+            auto session_path = request_path.substr(std::strlen("/session/"));
+            const auto query_pos = session_path.find('?');
+            if (query_pos != std::string::npos) {
+                session_path = session_path.substr(0, query_pos);
+            }
+            const auto answer_suffix = std::string("/answer");
+            if (session_path.size() > answer_suffix.size() &&
+                session_path.compare(session_path.size() - answer_suffix.size(), answer_suffix.size(), answer_suffix) == 0) {
+                auto session_id = session_path.substr(0, session_path.size() - answer_suffix.size());
+                const auto accepted = webrtc_service_.set_native_answer(url_decode(session_id), request_body);
+                return make_json_response(std::string("{\"ok\":") + (accepted ? "true" : "false") + "}");
+            }
+        }
+        if (method == "DELETE" && request_path.rfind("/session/", 0) == 0) {
+            auto session_id = request_path.substr(std::strlen("/session/"));
+            const auto query_pos = session_id.find('?');
+            if (query_pos != std::string::npos) {
+                session_id = session_id.substr(0, query_pos);
+            }
+            const auto closed = webrtc_service_.close_session(url_decode(session_id));
+            return make_json_response(std::string("{\"ok\":") + (closed ? "true" : "false") + "}");
+        }
+        if (method == "PATCH") {
+            return make_json_response("{\"ok\":true,\"trickle_ice\":\"ignored\"}");
+        }
+        return make_json_response("{\"ok\":false,\"error\":\"unsupported native WebRTC session method\"}", "405 Method Not Allowed");
+    }
     return proxy_webrtc_request(
         method,
         request_path,

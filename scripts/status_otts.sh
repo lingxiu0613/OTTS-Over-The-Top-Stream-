@@ -14,7 +14,7 @@ echo "[OTTS] srt sessions:"
 curl -s http://127.0.0.1:3000/api/srt/sessions || true
 echo
 echo "[OTTS] listeners:"
-ss -ltnp | grep -E ':1935|:1985|:3000|:3443|:8080|:8081|:8554|:8556' || true
+ss -ltnp | grep -E ':1935|:1985|:3000|:3443|:8080|:8081|:8554|:8556|:8560' || true
 ss -lunp | grep -E ':9000|:10000' || true
 echo
 echo "[OTTS] recent core log:"

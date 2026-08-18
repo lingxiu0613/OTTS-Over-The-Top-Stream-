@@ -128,6 +128,10 @@ export class RtspCompatManager {
         ? `rtsp://0.0.0.0:${this.publishPort}/${this.buildMount(streamKey)}`
         : `rtsp://0.0.0.0:${this.playPort}/${this.buildMount(streamKey)}`,
       target_url: this.targetRtmpUrl(streamKey),
+      transport: "tcp/udp",
+      media_path: "rtsp-compat-desired-route",
+      native_stage: "compat-desired",
+      codec_hint: "h264/aac passthrough",
       pid: "0",
       started_at_epoch_ms: "0",
       last_stopped_at_epoch_ms: "0",

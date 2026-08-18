@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstring>
 #include <fstream>
+#include <iomanip>
 #include <sstream>
 namespace otts::rtmp {
 
@@ -46,6 +47,24 @@ std::string base64_encode(const std::vector<std::uint8_t>& data) {
     }
 
     return output;
+}
+
+
+std::string hex_encode(const std::vector<std::uint8_t>& bytes) {
+    std::ostringstream out;
+    out << std::hex << std::setfill('0');
+    for (const auto byte : bytes) {
+        out << std::setw(2) << static_cast<int>(byte);
+    }
+    return out.str();
+}
+
+std::uint32_t aac_sample_rate_from_index(std::uint8_t index) {
+    static constexpr std::array<std::uint32_t, 13> kRates{
+        96000, 88200, 64000, 48000, 44100, 32000, 24000,
+        22050, 16000, 12000, 11025, 8000, 7350
+    };
+    return index < kRates.size() ? kRates[index] : 0;
 }
 
 }  // namespace
@@ -302,12 +321,13 @@ void StreamRegistry::update_external_viewers(
     const std::string& managed_by,
     std::size_t viewer_count) {
     std::lock_guard<std::mutex> lock(mutex_);
+    const auto existing = streams_.find(stream_key);
     auto& stream = streams_[stream_key];
-    if (stream.publisher.expired()) {
+    if (existing == streams_.end() && stream.publisher.expired()) {
         stream.source = source;
+        stream.ingest_origin = source;
+        stream.managed_by = managed_by;
     }
-    stream.ingest_origin = source;
-    stream.managed_by = managed_by;
     stream.external_viewer_count = viewer_count;
     persist_state_locked();
 }
@@ -322,6 +342,10 @@ void StreamRegistry::upsert_external_session(
     const std::string& public_url,
     const std::string& bind_url,
     const std::string& target_url,
+    const std::string& transport,
+    const std::string& media_path,
+    const std::string& native_stage,
+    const std::string& codec_hint,
     std::int64_t pid,
     std::uint64_t started_at_epoch_ms,
     std::uint64_t last_stopped_at_epoch_ms,
@@ -338,6 +362,10 @@ void StreamRegistry::upsert_external_session(
     session.public_url = public_url;
     session.bind_url = bind_url;
     session.target_url = target_url;
+    session.transport = transport;
+    session.media_path = media_path;
+    session.native_stage = native_stage;
+    session.codec_hint = codec_hint;
     session.pid = pid;
     session.started_at_epoch_ms = started_at_epoch_ms;
     session.updated_at_epoch_ms = now_epoch_ms();
@@ -436,6 +464,10 @@ std::vector<StreamRegistry::ExternalSessionSnapshot> StreamRegistry::external_se
         snapshot.public_url = state.public_url;
         snapshot.bind_url = state.bind_url;
         snapshot.target_url = state.target_url;
+        snapshot.transport = state.transport;
+        snapshot.media_path = state.media_path;
+        snapshot.native_stage = state.native_stage;
+        snapshot.codec_hint = state.codec_hint;
         snapshot.pid = state.pid;
         snapshot.started_at_epoch_ms = state.started_at_epoch_ms;
         snapshot.updated_at_epoch_ms = state.updated_at_epoch_ms;
@@ -520,6 +552,23 @@ std::optional<StreamRegistry::RtspDescribeInfo> StreamRegistry::rtsp_describe_in
                                   payload.begin() + static_cast<std::ptrdiff_t>(offset + pps_length));
 
     info.sprop_parameter_sets = base64_encode(sps) + "," + base64_encode(pps);
+
+    if (it->second.audio_sequence_header.has_value()) {
+        const auto& audio_payload = it->second.audio_sequence_header->payload;
+        if (audio_payload.size() >= 4 && ((audio_payload[0] >> 4) & 0x0F) == 10 && audio_payload[1] == 0) {
+            std::vector<std::uint8_t> config(audio_payload.begin() + 2, audio_payload.end());
+            const auto sampling_index = static_cast<std::uint8_t>(((config[0] & 0x07) << 1) | ((config[1] >> 7) & 0x01));
+            const auto channels = static_cast<std::uint8_t>((config[1] >> 3) & 0x0F);
+            const auto sample_rate = aac_sample_rate_from_index(sampling_index);
+            if (sample_rate > 0 && channels > 0) {
+                info.has_audio = true;
+                info.audio_codec = "aac";
+                info.audio_config = hex_encode(config);
+                info.audio_sample_rate = sample_rate;
+                info.audio_channels = channels;
+            }
+        }
+    }
     return info;
 }
 
@@ -709,6 +758,10 @@ void StreamRegistry::persist_state_locked() const {
         file << "      \"public_url\": \"" << json_escape(state.public_url) << "\",\n";
         file << "      \"bind_url\": \"" << json_escape(state.bind_url) << "\",\n";
         file << "      \"target_url\": \"" << json_escape(state.target_url) << "\",\n";
+        file << "      \"transport\": \"" << json_escape(state.transport) << "\",\n";
+        file << "      \"media_path\": \"" << json_escape(state.media_path) << "\",\n";
+        file << "      \"native_stage\": \"" << json_escape(state.native_stage) << "\",\n";
+        file << "      \"codec_hint\": \"" << json_escape(state.codec_hint) << "\",\n";
         file << "      \"pid\": " << state.pid << ",\n";
         file << "      \"started_at_epoch_ms\": " << state.started_at_epoch_ms << ",\n";
         file << "      \"updated_at_epoch_ms\": " << state.updated_at_epoch_ms << ",\n";

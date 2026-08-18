@@ -8,17 +8,20 @@ namespace otts::core {
 class Logger {
 public:
     enum class Level {
-        Info,
-        Warn,
-        Error,
-        Debug
+        Debug = 0,
+        Info = 1,
+        Warn = 2,
+        Error = 3
     };
 
     static Logger& instance();
     void log(Level level, const std::string& component, const std::string& message);
+    void set_level(Level level);
+    Level level() const;
 
 private:
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
+    Level threshold_{Level::Info};
 };
 
 void log_info(const std::string& component, const std::string& message);

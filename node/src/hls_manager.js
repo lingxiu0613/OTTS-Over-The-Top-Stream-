@@ -3,6 +3,7 @@ import fsp from "fs/promises";
 import os from "os";
 import path from "path";
 import { spawn } from "child_process";
+import { buildRtmpUrl } from "./rtmp_url.js";
 
 function sanitizeSegment(segment) {
   return segment.replace(/[^a-zA-Z0-9._-]/g, "_");
@@ -107,6 +108,18 @@ export class HlsManager {
     const proc = this.processes.get(streamKey);
     const playlist = this.playlistPath(streamKey);
     const exists = fs.existsSync(playlist);
+    let playlistMtimeEpochMs = null;
+    let playlistAgeMs = null;
+    if (exists) {
+      try {
+        const stat = fs.statSync(playlist);
+        playlistMtimeEpochMs = stat.mtimeMs;
+        playlistAgeMs = Date.now() - stat.mtimeMs;
+      } catch {
+        playlistMtimeEpochMs = null;
+        playlistAgeMs = null;
+      }
+    }
     return {
       stream_key: streamKey,
       hls_path: this.publicPath(streamKey),
@@ -115,6 +128,8 @@ export class HlsManager {
       master_playlist_path: this.masterPlaylistPath(streamKey),
       playlist_exists: exists,
       master_playlist_exists: fs.existsSync(this.masterPlaylistPath(streamKey)),
+      playlist_mtime_epoch_ms: playlistMtimeEpochMs,
+      playlist_age_ms: playlistAgeMs,
       running: Boolean(proc && !proc.exited),
       pid: proc?.child.pid || null,
       started_at: proc?.startedAt || null,
@@ -128,6 +143,7 @@ export class HlsManager {
   }
 
   async writeMasterPlaylist(streamKey) {
+    await fsp.mkdir(streamDir(this.rootDir, streamKey), { recursive: true });
     const content = [
       "#EXTM3U",
       "#EXT-X-VERSION:3",
@@ -157,7 +173,7 @@ export class HlsManager {
     const segmentPattern = path.join(outputDir, "seg_%05d.ts");
     const logPath = path.join(outputDir, "ffmpeg.log");
     const logStream = fs.createWriteStream(logPath, { flags: "a" });
-    const inputUrl = `${this.rtmpBase}/${streamKey}`;
+    const inputUrl = buildRtmpUrl(this.rtmpBase, streamKey, "play");
 
     const child = spawn(
       this.ffmpegBin,
@@ -291,18 +307,35 @@ export class HlsManager {
   }
 
   async cleanupStaleOutputs() {
+    return this.cleanupStaleOutputsWithReport(false);
+  }
+
+  async cleanupStaleOutputsWithReport(includeRunning = false) {
+    const removed = [];
     try {
       const playlistDirs = await collectPlaylistDirs(this.rootDir);
       const now = Date.now();
+      const activeDirs = new Set(
+        [...this.processes.entries()]
+          .filter(([, proc]) => proc && !proc.exited)
+          .map(([streamKey]) => streamDir(this.rootDir, streamKey))
+      );
+
       for (const dir of playlistDirs) {
+        if (!includeRunning && activeDirs.has(dir)) {
+          continue;
+        }
         const playlist = path.join(dir, "index.m3u8");
         const stat = await fsp.stat(playlist);
-        if (now - stat.mtimeMs > this.cleanupAgeMs) {
+        const ageMs = now - stat.mtimeMs;
+        if (ageMs > this.cleanupAgeMs) {
           await rimrafDir(dir);
+          removed.push({ dir, age_ms: ageMs });
         }
       }
     } catch {
       // ignore cleanup errors
     }
+    return removed;
   }
 }

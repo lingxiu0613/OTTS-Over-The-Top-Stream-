@@ -63,6 +63,11 @@ public:
         std::string video_codec;
         std::string profile_level_id;
         std::string sprop_parameter_sets;
+        bool has_audio{false};
+        std::string audio_codec;
+        std::string audio_config;
+        std::uint32_t audio_sample_rate{0};
+        std::uint8_t audio_channels{0};
     };
 
     struct ExternalSessionSnapshot {
@@ -75,6 +80,10 @@ public:
         std::string public_url;
         std::string bind_url;
         std::string target_url;
+        std::string transport;
+        std::string media_path;
+        std::string native_stage;
+        std::string codec_hint;
         std::int64_t pid{0};
         std::uint64_t started_at_epoch_ms{0};
         std::uint64_t updated_at_epoch_ms{0};
@@ -118,6 +127,10 @@ public:
         const std::string& public_url,
         const std::string& bind_url,
         const std::string& target_url,
+        const std::string& transport,
+        const std::string& media_path,
+        const std::string& native_stage,
+        const std::string& codec_hint,
         std::int64_t pid,
         std::uint64_t started_at_epoch_ms,
         std::uint64_t last_stopped_at_epoch_ms,
@@ -191,6 +204,10 @@ private:
         std::string public_url;
         std::string bind_url;
         std::string target_url;
+        std::string transport;
+        std::string media_path;
+        std::string native_stage;
+        std::string codec_hint;
         std::int64_t pid{0};
         std::uint64_t started_at_epoch_ms{0};
         std::uint64_t updated_at_epoch_ms{0};

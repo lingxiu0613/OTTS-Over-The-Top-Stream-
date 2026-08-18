@@ -1,23 +1,46 @@
 #!/usr/bin/env python3
 
 import argparse
+import hashlib
+import hmac
 import asyncio
 from fractions import Fraction
 import logging
+import os
 import time
 import uuid
+from urllib.parse import quote
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlencode
 
 from aiohttp import ClientSession, web
 from aiortc import MediaStreamTrack, RTCPeerConnection, RTCSessionDescription
-from aiortc.contrib.media import MediaRecorder, MediaRelay
+from aiortc.contrib.media import MediaPlayer, MediaRecorder, MediaRelay
 from aiortc.sdp import candidate_from_sdp
 
 
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s %(message)s")
 
+
+def sign_stream_url(action: str, stream_key: str, expires: str, secret: str) -> str:
+    payload = f"{action}\n{stream_key}\n{expires}".encode("utf-8")
+    return hmac.new(secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()
+
+
+def append_rtmp_token(url: str, action: str = "publish", stream_key: str = "") -> str:
+    token = os.environ.get("OTTS_STREAM_TOKEN", "")
+    if token:
+        separator = "&" if "?" in url else "?"
+        return f"{url}{separator}token={quote(token, safe='')}"
+    secret = os.environ.get("OTTS_AUTH_SECRET", "")
+    if not secret or not stream_key:
+        return url
+    ttl = max(1, int(os.environ.get("OTTS_AUTH_TTL_SECONDS", "3600") or "3600"))
+    expires = str(int(time.time()) + ttl)
+    signature = sign_stream_url(action, stream_key, expires, secret)
+    separator = "&" if "?" in url else "?"
+    return f"{url}{separator}expires={quote(expires, safe='')}&sign={quote(signature, safe='')}"
 
 def now_ms() -> int:
     return int(time.time() * 1000)
@@ -168,6 +191,8 @@ class SessionInfo:
     updated_at_ms: int = field(default_factory=now_ms)
     last_error: str = ""
     bridge_url: str = ""
+    core_media_url: str = ""
+    player: Any | None = None
     offer_size: int = 0
     answer_size: int = 0
 
@@ -181,18 +206,23 @@ class SessionInfo:
             "updated_at_epoch_ms": self.updated_at_ms,
             "last_error": self.last_error,
             "bridge_url": self.bridge_url,
+            "core_media_url": self.core_media_url,
             "offer_size": self.offer_size,
             "answer_size": self.answer_size,
         }
 
 
 class GatewayState:
-    def __init__(self, core_rtmp_base: str, enable_rtmp_bridge: bool) -> None:
+    def __init__(self, core_rtmp_base: str, core_http_flv_base: str, enable_rtmp_bridge: bool) -> None:
         self.relay = MediaRelay()
         self.publishers: dict[str, PublishedStream] = {}
         self.sessions: dict[str, SessionInfo] = {}
         self.core_rtmp_base = core_rtmp_base.rstrip("/")
+        self.core_http_flv_base = core_http_flv_base.rstrip("/")
         self.enable_rtmp_bridge = enable_rtmp_bridge
+
+    def core_flv_url(self, stream_key: str) -> str:
+        return f"{self.core_http_flv_base}/{stream_key}.flv"
 
     def prune_closed_sessions(self) -> None:
         removable = {
@@ -257,6 +287,74 @@ class GatewayState:
         except Exception:
             pass
 
+    def core_session_key(self, info: SessionInfo) -> str:
+        return f"webrtc:{info.direction}:{info.session_id}"
+
+    def session_public_url(self, info: SessionInfo) -> str:
+        endpoint = "whip" if info.direction == "whip" else "whep"
+        return f"/{endpoint}/v1?stream_key={quote(info.stream_key, safe='')}"
+
+    def session_target_url(self, info: SessionInfo) -> str:
+        if info.direction == "whip" and self.enable_rtmp_bridge:
+            return info.bridge_url or append_rtmp_token(f"{self.core_rtmp_base}/{info.stream_key}", "publish", info.stream_key)
+        if info.direction == "whep" and info.core_media_url:
+            return info.core_media_url
+        return f"aiortc://{info.direction}/{info.stream_key}"
+
+    def session_codec_hint(self, info: SessionInfo) -> str:
+        publisher = self.publishers.get(info.stream_key)
+        if publisher:
+            codecs = [publisher.video_codec, publisher.audio_codec]
+            return "/".join(codec for codec in codecs if codec)
+        return "webrtc"
+
+    async def sync_core_session(self, info: SessionInfo) -> None:
+        source_protocol = "whip" if info.direction == "whip" else "whep"
+        direction = "publish" if info.direction == "whip" else "play"
+        is_bridge = info.direction == "whip" and self.enable_rtmp_bridge
+        is_core_egress = info.direction == "whep" and bool(info.core_media_url)
+        params = urlencode(
+            {
+                "session_key": self.core_session_key(info),
+                "stream_key": info.stream_key,
+                "source_protocol": source_protocol,
+                "direction": direction,
+                "managed_by": "python-webrtc-gateway",
+                "state": info.state,
+                "public_url": self.session_public_url(info),
+                "bind_url": f"0.0.0.0:8081/{info.direction}/v1",
+                "target_url": self.session_target_url(info),
+                "transport": "webrtc/ice-dtls-srtp",
+                "media_path": "webrtc-aiortc-core-rtmp-ingress" if is_bridge else ("webrtc-aiortc-core-httpflv-egress" if is_core_egress else "webrtc-aiortc-relay"),
+                "native_stage": "core-ingress" if is_bridge else ("core-egress" if is_core_egress else "compat-gateway"),
+                "codec_hint": self.session_codec_hint(info),
+                "pid": str(os.getpid()),
+                "started_at_epoch_ms": str(info.created_at_ms),
+                "last_stopped_at_epoch_ms": str(info.updated_at_ms if info.state in {"closed", "failed"} else 0),
+                "restart_count": "0",
+                "last_exit_code": "0",
+                "last_error": info.last_error,
+            }
+        )
+        url = f"http://127.0.0.1:8080/api/internal/sessions/upsert?{params}"
+        try:
+            async with ClientSession() as session:
+                async with session.post(url) as response:
+                    await response.text()
+        except Exception as exc:
+            info.last_error = f"core session sync failed: {exc}"
+            info.updated_at_ms = now_ms()
+
+    async def remove_core_session(self, info: SessionInfo) -> None:
+        params = urlencode({"session_key": self.core_session_key(info)})
+        url = f"http://127.0.0.1:8080/api/internal/sessions/remove?{params}"
+        try:
+            async with ClientSession() as session:
+                async with session.post(url) as response:
+                    await response.text()
+        except Exception:
+            pass
+
     async def start_bridge(self, stream_key: str) -> None:
         if not self.enable_rtmp_bridge:
             return
@@ -289,6 +387,8 @@ class GatewayState:
         await info.pc.close()
         info.state = "closed"
         info.updated_at_ms = now_ms()
+        await self.sync_core_session(info)
+        await self.remove_core_session(info)
         for stream_key, publisher in list(self.publishers.items()):
             if publisher.session_id == session_id:
                 if publisher.recorder_started and publisher.recorder is not None:
@@ -478,6 +578,7 @@ async def whip(request: web.Request) -> web.Response:
     session = SessionInfo(session_id=session_id, stream_key=stream_key, direction="whip", pc=pc, state="connecting")
     session.offer_size = len(offer_sdp)
     STATE.sessions[session_id] = session
+    await STATE.sync_core_session(session)
 
     old = STATE.publishers.get(stream_key)
     if old:
@@ -486,8 +587,10 @@ async def whip(request: web.Request) -> web.Response:
         if old_session:
             old_session.state = "replaced"
             old_session.updated_at_ms = now_ms()
+            await STATE.sync_core_session(old_session)
+            await STATE.remove_core_session(old_session)
 
-    bridge_url = f"{STATE.core_rtmp_base}/{stream_key}"
+    bridge_url = append_rtmp_token(f"{STATE.core_rtmp_base}/{stream_key}", "publish", stream_key)
     offer_codecs = parse_offer_codecs(offer_sdp)
     publisher = PublishedStream(
         stream_key=stream_key,
@@ -522,6 +625,7 @@ async def whip(request: web.Request) -> web.Response:
         session.updated_at_ms = now_ms()
         publisher.updated_at_ms = now_ms()
         logging.info("WHIP connection state session_id=%s state=%s", session_id, pc.connectionState)
+        await STATE.sync_core_session(session)
         if pc.connectionState == "connected":
             await STATE.sync_core_stream(publisher, True)
         if pc.connectionState in {"failed", "closed"}:
@@ -530,6 +634,7 @@ async def whip(request: web.Request) -> web.Response:
             await STATE.sync_core_stream(publisher, False)
             STATE.publishers.pop(stream_key, None)
             await STATE.sync_core_viewers(stream_key)
+            await STATE.remove_core_session(session)
             STATE.prune_closed_sessions()
 
     @pc.on("iceconnectionstatechange")
@@ -538,6 +643,7 @@ async def whip(request: web.Request) -> web.Response:
         logging.info("WHIP ICE state session_id=%s state=%s", session_id, pc.iceConnectionState)
         if pc.iceConnectionState == "failed":
             session.last_error = "ice connection failed"
+            await STATE.sync_core_session(session)
 
     try:
         await pc.setRemoteDescription(RTCSessionDescription(sdp=offer_sdp, type="offer"))
@@ -550,6 +656,7 @@ async def whip(request: web.Request) -> web.Response:
         session.state = "connected"
         session.answer_size = len(pc.localDescription.sdp)
         session.updated_at_ms = now_ms()
+        await STATE.sync_core_session(session)
     except Exception as exc:
         logging.exception("WHIP failed session_id=%s stream_key=%s", session_id, stream_key)
         session.state = "failed"
@@ -557,6 +664,7 @@ async def whip(request: web.Request) -> web.Response:
         session.updated_at_ms = now_ms()
         STATE.publishers.pop(stream_key, None)
         await STATE.sync_core_stream(publisher, False)
+        await STATE.sync_core_session(session)
         await pc.close()
         return cors(web.Response(status=400, text=f"invalid WHIP offer: {exc}"))
 
@@ -570,7 +678,8 @@ async def whip(request: web.Request) -> web.Response:
 async def whep(request: web.Request) -> web.Response:
     stream_key = derive_stream_key(request)
     offer_sdp = await request.text()
-    bridge_url = f"{STATE.core_rtmp_base}/{stream_key}"
+    bridge_url = append_rtmp_token(f"{STATE.core_rtmp_base}/{stream_key}", "publish", stream_key)
+    core_media_url = STATE.core_flv_url(stream_key)
     logging.info("WHEP start stream_key=%s body_len=%d", stream_key, len(offer_sdp))
 
     source = await STATE.wait_for_publisher_tracks(stream_key, timeout=5.0)
@@ -581,13 +690,16 @@ async def whep(request: web.Request) -> web.Response:
         session.bridge_url = bridge_url
         session.offer_size = len(offer_sdp)
         STATE.sessions[session_id] = session
+        await STATE.sync_core_session(session)
 
         @pc.on("connectionstatechange")
         async def on_connectionstatechange() -> None:
             session.state = pc.connectionState
             session.updated_at_ms = now_ms()
+            await STATE.sync_core_session(session)
             await STATE.sync_core_viewers(stream_key)
             if pc.connectionState in {"failed", "closed"}:
+                await STATE.remove_core_session(session)
                 STATE.prune_closed_sessions()
 
         @pc.on("iceconnectionstatechange")
@@ -595,6 +707,7 @@ async def whep(request: web.Request) -> web.Response:
             session.updated_at_ms = now_ms()
             if pc.iceConnectionState == "failed":
                 session.last_error = "ice connection failed"
+                await STATE.sync_core_session(session)
 
         try:
             await pc.setRemoteDescription(RTCSessionDescription(sdp=offer_sdp, type="offer"))
@@ -607,11 +720,13 @@ async def whep(request: web.Request) -> web.Response:
             session.state = "connected"
             session.answer_size = len(pc.localDescription.sdp)
             session.updated_at_ms = now_ms()
+            await STATE.sync_core_session(session)
             await STATE.sync_core_viewers(stream_key)
         except Exception as exc:
             session.state = "failed"
             session.last_error = str(exc)
             session.updated_at_ms = now_ms()
+            await STATE.sync_core_session(session)
             await pc.close()
             await STATE.sync_core_viewers(stream_key)
             STATE.prune_closed_sessions()
@@ -622,7 +737,65 @@ async def whep(request: web.Request) -> web.Response:
         response.headers["X-Session-Id"] = session_id
         return cors(response)
 
-    return cors(web.Response(status=404, text="stream not available yet"))
+    session_id = uuid.uuid4().hex
+    pc = RTCPeerConnection()
+    session = SessionInfo(session_id=session_id, stream_key=stream_key, direction="whep", pc=pc, state="connecting")
+    session.bridge_url = bridge_url
+    session.core_media_url = core_media_url
+    session.offer_size = len(offer_sdp)
+    STATE.sessions[session_id] = session
+    await STATE.sync_core_session(session)
+
+    @pc.on("connectionstatechange")
+    async def on_connectionstatechange() -> None:
+        session.state = pc.connectionState
+        session.updated_at_ms = now_ms()
+        await STATE.sync_core_session(session)
+        await STATE.sync_core_viewers(stream_key)
+        if pc.connectionState in {"failed", "closed"}:
+            await STATE.remove_core_session(session)
+            STATE.prune_closed_sessions()
+
+    @pc.on("iceconnectionstatechange")
+    async def on_iceconnectionstatechange() -> None:
+        session.updated_at_ms = now_ms()
+        if pc.iceConnectionState == "failed":
+            session.last_error = "ice connection failed"
+            await STATE.sync_core_session(session)
+
+    try:
+        await pc.setRemoteDescription(RTCSessionDescription(sdp=offer_sdp, type="offer"))
+        player = MediaPlayer(core_media_url, format="flv")
+        session.player = player
+        if player.video:
+            pc.addTrack(NormalizedTrack(player.video))
+        if player.audio:
+            pc.addTrack(NormalizedTrack(player.audio))
+        if not player.video and not player.audio:
+            raise RuntimeError("core stream has no playable tracks")
+
+        answer = await pc.createAnswer()
+        await pc.setLocalDescription(answer)
+        await wait_for_ice_complete(pc)
+        session.state = "connected"
+        session.answer_size = len(pc.localDescription.sdp)
+        session.updated_at_ms = now_ms()
+        await STATE.sync_core_session(session)
+        await STATE.sync_core_viewers(stream_key)
+    except Exception as exc:
+        session.state = "failed"
+        session.last_error = str(exc)
+        session.updated_at_ms = now_ms()
+        await STATE.sync_core_session(session)
+        await pc.close()
+        await STATE.sync_core_viewers(stream_key)
+        STATE.prune_closed_sessions()
+        return cors(web.Response(status=404, text=f"core stream not available yet: {exc}"))
+
+    response = web.Response(status=201, text=pc.localDescription.sdp, content_type="application/sdp")
+    response.headers["Location"] = f"/session/{session_id}"
+    response.headers["X-Session-Id"] = session_id
+    return cors(response)
 
 
 def build_app() -> web.Application:
@@ -648,12 +821,14 @@ def main() -> None:
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8081)
     parser.add_argument("--core-rtmp-base", default="rtmp://127.0.0.1:1935")
+    parser.add_argument("--core-http-flv-base", default="http://127.0.0.1:8080")
     parser.add_argument("--enable-rtmp-bridge", action="store_true")
     args = parser.parse_args()
 
     global STATE
     STATE = GatewayState(
         core_rtmp_base=args.core_rtmp_base,
+        core_http_flv_base=args.core_http_flv_base,
         enable_rtmp_bridge=args.enable_rtmp_bridge,
     )
     web.run_app(build_app(), host=args.host, port=args.port)

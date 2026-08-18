@@ -236,7 +236,7 @@
               <th>Cache</th>
               <th>Media</th>
               <th>Playback URLs</th>
-              <th>HLS</th>
+              <th>HLS / Recording</th>
               <th>Actions</th>
             </tr>
           </thead>
@@ -648,6 +648,16 @@
         }
       }
 
+      async function startRecording(streamKey, format = "flv") {
+        await callJson(`/api/recordings/start?stream_key=${encodeURIComponent(streamKey)}&format=${encodeURIComponent(format)}`, { method: "POST" });
+        await load();
+      }
+
+      async function stopRecording(streamKey) {
+        await callJson(`/api/recordings/stop?stream_key=${encodeURIComponent(streamKey)}`, { method: "POST" });
+        await load();
+      }
+
       async function disconnectStream(streamKey) {
         await callJson(`/api/streams/disconnect?stream_key=${encodeURIComponent(streamKey)}`, { method: "POST" });
         await load();
@@ -666,6 +676,10 @@
           const hlsBadge = hls.playlist_exists
             ? '<span class="pill">playlist ready</span>'
             : (hls.running ? '<span class="pill warn">starting</span>' : '<span class="pill bad">stopped</span>');
+          const recording = stream.recording || {};
+          const recordingBadge = recording.running
+            ? `<span class="pill">rec ${recording.format || "flv"}</span>`
+            : '<span class="pill bad">rec stopped</span>';
           const bitrate = formatBitrate(
             stream.total_bytes,
             stream.first_media_at_epoch_ms,
@@ -680,12 +694,15 @@
               <td>meta:${stream.has_metadata ? "Y" : "N"}<br/>audio-sh:${stream.has_audio_sequence_header ? "Y" : "N"}<br/>video-sh:${stream.has_video_sequence_header ? "Y" : "N"}<br/>gop:${stream.gop_cache_size}</td>
               <td>vcodec:${stream.video_codec || "-"}<br/>acodec:${stream.audio_codec || "-"}<br/>packets:${stream.total_packets ?? 0}<br/>bitrate:${bitrate}<br/>last-key:${stream.last_keyframe_at_epoch_ms ? new Date(stream.last_keyframe_at_epoch_ms).toLocaleTimeString() : "-"}</td>
               <td><code>${urls.rtmp}</code><br/><code>${urls.flv}</code><br/><code>${urls.hls}</code><br/><code>${urls.hlsMaster}</code></td>
-              <td>${hlsBadge}<br/>pid:${hls.pid ?? "-"}<br/>exit:${hls.last_exit_code ?? "-"}<br/>restart:${hls.restart_count ?? 0}</td>
+              <td>${hlsBadge}<br/>pid:${hls.pid ?? "-"}<br/>exit:${hls.last_exit_code ?? "-"}<br/>restart:${hls.restart_count ?? 0}<br/>${recordingBadge}<br/>rec bytes:${recording.bytes ?? 0}</td>
               <td>
                 <button class="good" data-action="play-flv" data-url="${urls.flv}">Play FLV</button>
                 <button class="secondary" data-action="copy-hls" data-url="${urls.hls}">Use HLS</button>
                 <button data-action="start-hls" data-stream="${stream.stream_key}">Start HLS</button>
                 <button class="secondary" data-action="stop-hls" data-stream="${stream.stream_key}">Stop HLS</button>
+                <button data-action="start-rec-flv" data-stream="${stream.stream_key}">Rec FLV</button>
+                <button class="secondary" data-action="start-rec-mp4" data-stream="${stream.stream_key}">Rec MP4</button>
+                <button class="secondary" data-action="stop-rec" data-stream="${stream.stream_key}">Stop Rec</button>
                 <button data-action="disconnect" data-stream="${stream.stream_key}">Disconnect</button>
               </td>
             </tr>
@@ -718,6 +735,12 @@
                 await startHls(streamKey);
               } else if (action === "stop-hls") {
                 await stopHls(streamKey);
+              } else if (action === "start-rec-flv") {
+                await startRecording(streamKey, "flv");
+              } else if (action === "start-rec-mp4") {
+                await startRecording(streamKey, "mp4");
+              } else if (action === "stop-rec") {
+                await stopRecording(streamKey);
               } else if (action === "disconnect") {
                 await disconnectStream(streamKey);
               }

@@ -2,6 +2,7 @@ import crypto from "crypto";
 import dgram from "dgram";
 import net from "net";
 import { spawn } from "child_process";
+import { buildHttpFlvUrl, buildRtmpUrl, isStreamTokenAuthorizedFromUri } from "./rtmp_url.js";
 import { URLSearchParams } from "url";
 
 function normalizeRtspMount(value) {
@@ -16,6 +17,9 @@ function normalizeRtspMount(value) {
   }
   if (mount.endsWith("/trackID=0")) {
     mount = mount.slice(0, -"/trackID=0".length);
+  }
+  if (mount.endsWith("/")) {
+    mount = mount.slice(0, -1);
   }
   if (mount.endsWith(".sdp")) {
     mount = mount.slice(0, -4);
@@ -69,12 +73,13 @@ async function bindUdpSocket(host) {
 
 export class RtspPlaybackServer {
   constructor(options = {}) {
-    this.port = options.port || 8556;
+    this.port = Number.isFinite(options.port) ? options.port : 8556;
     this.host = options.host || "0.0.0.0";
     this.publicHost = options.publicHost || "127.0.0.1";
     this.apiBase = options.apiBase || "http://127.0.0.1:8080";
     this.rtmpBase = options.rtmpBase || "rtmp://127.0.0.1:1935";
     this.ffmpegBin = options.ffmpegBin || "ffmpeg";
+    this.defaultPlayMode = options.defaultPlayMode || "core-egress-flv";
     this.server = null;
     this.connections = new Set();
     this.activeSessions = new Map();
@@ -90,6 +95,8 @@ export class RtspPlaybackServer {
       client_rtp_port: session.clientRtpPort || 0,
       interleaved_rtp_channel: session.interleavedRtpChannel,
       ffmpeg_pid: session.ffmpeg?.pid || null,
+      play_mode: session.playMode || this.defaultPlayMode,
+      input_url: session.inputUrl || "",
       play_started_at_epoch_ms: session.playStartedEpochMs || 0
     }));
   }
@@ -106,10 +113,16 @@ export class RtspPlaybackServer {
     return `rtsp://0.0.0.0:${this.port}/${connection.streamPath}.sdp`;
   }
 
+  coreFlvUrl(streamKey) {
+    return buildHttpFlvUrl(this.apiBase, streamKey);
+  }
+
   async syncCoreSession(connection, stateOverride = "") {
     if (!connection.streamKey || !connection.streamPath) {
       return;
     }
+    const playMode = connection.playMode || this.defaultPlayMode;
+    const isCoreEgress = playMode === "core-egress-flv";
     const params = new URLSearchParams({
       session_key: this.sessionKey(connection),
       stream_key: connection.streamKey,
@@ -119,7 +132,11 @@ export class RtspPlaybackServer {
       state: stateOverride || connection.state || "connected",
       public_url: this.publicUrl(connection),
       bind_url: this.bindUrl(connection),
-      target_url: `${this.rtmpBase}/${connection.streamKey}`,
+      target_url: isCoreEgress ? this.coreFlvUrl(connection.streamKey) : `${this.rtmpBase}/${connection.streamKey}`,
+      transport: connection.transportMode === "tcp" ? "rtsp/rtp-tcp-interleaved" : "rtsp/rtp-udp",
+      media_path: isCoreEgress ? "core-http-flv-ffmpeg-rtsp" : "rtsp-native-control+ffmpeg-rtmp-bridge",
+      native_stage: isCoreEgress ? "core-egress" : "native-control",
+      codec_hint: "h264",
       pid: String(connection.ffmpeg?.pid || 0),
       started_at_epoch_ms: String(connection.playStartedEpochMs || 0),
       last_stopped_at_epoch_ms: stateOverride === "closed" ? String(Date.now()) : "0",
@@ -146,7 +163,7 @@ export class RtspPlaybackServer {
   }
 
   start() {
-    if (this.server) {
+    if (this.server || this.port <= 0) {
       return;
     }
     this.server = net.createServer((socket) => this.handleConnection(socket));
@@ -183,7 +200,10 @@ export class RtspPlaybackServer {
       ffmpeg: null,
       state: "connected",
       lastError: "",
-      playStartedEpochMs: 0
+      playStartedEpochMs: 0,
+      playMode: this.defaultPlayMode,
+      inputUrl: "",
+      authorized: false
     };
     this.connections.add(connection);
 
@@ -333,6 +353,16 @@ export class RtspPlaybackServer {
       }
     }
 
+    if (!connection.authorized) {
+      const authStreamKey = connection.streamKey || streamKeyCandidates[0] || "";
+      if (!isStreamTokenAuthorizedFromUri(uri, "play", authStreamKey)) {
+        connection.state = "unauthorized";
+        this.send(connection, "401 Unauthorized", baseHeaders);
+        return;
+      }
+      connection.authorized = true;
+    }
+
     if (method === "DESCRIBE") {
       const describeResult = await this.fetchDescribeInfo(streamKeyCandidates);
       if (!describeResult) {
@@ -392,6 +422,10 @@ export class RtspPlaybackServer {
         connection.ffmpeg.kill("SIGTERM");
       }
       const remoteIp = (connection.socket.remoteAddress || "").replace("::ffff:", "");
+      connection.playMode = connection.playMode || this.defaultPlayMode;
+      connection.inputUrl = connection.playMode === "core-egress-flv"
+        ? this.coreFlvUrl(connection.streamKey)
+        : buildRtmpUrl(this.rtmpBase, connection.streamKey, "play");
       connection.state = "play-starting";
       connection.ffmpeg = spawn(
         this.ffmpegBin,
@@ -402,7 +436,7 @@ export class RtspPlaybackServer {
           "-fflags",
           "nobuffer",
           "-i",
-          `${this.rtmpBase}/${connection.streamKey}`,
+          connection.inputUrl,
           "-map",
           "0:v:0",
           "-an",

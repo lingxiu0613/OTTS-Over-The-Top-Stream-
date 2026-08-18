@@ -158,7 +158,9 @@
       let publishSessionUrl = null;
 
       let playPc = null;
+      let playStream = null;
       let playSessionUrl = null;
+      let nativeRuntime = null;
 
       function updateSecurityHint() {
         const hint = document.getElementById("securityHint");
@@ -177,12 +179,58 @@
         logBox.textContent = `${line}${payload}\n\n${logBox.textContent}`;
       }
 
+      function isNativeRuntime() {
+        return nativeRuntime && nativeRuntime.selected_runtime === "native";
+      }
+
+      async function ensureRuntimeStatus() {
+        if (!nativeRuntime) {
+          await loadRuntimeStatus();
+        }
+        return nativeRuntime;
+      }
+
+      async function loadRuntimeStatus() {
+        try {
+          const response = await fetch(`${proxyBase}/api/webrtc/native`, { cache: "no-store" });
+          if (!response.ok) {
+            return;
+          }
+          nativeRuntime = await response.json();
+          const runtime = isNativeRuntime() ? "native video" : "gateway";
+          log("WebRTC runtime detected", { runtime, detail: nativeRuntime.detail });
+          syncPlayUrl();
+        } catch (error) {
+          log("WebRTC runtime check failed", { error: error.message });
+        }
+      }
+
+      function preferH264(transceiver) {
+        if (!transceiver || typeof transceiver.setCodecPreferences !== "function") {
+          return;
+        }
+        const capabilities = RTCRtpSender.getCapabilities?.("video");
+        if (!capabilities || !Array.isArray(capabilities.codecs)) {
+          return;
+        }
+        const h264 = capabilities.codecs.filter((codec) => /^video\/h264$/i.test(codec.mimeType));
+        if (!h264.length) {
+          return;
+        }
+        const rest = capabilities.codecs.filter((codec) => !/^video\/h264$/i.test(codec.mimeType));
+        transceiver.setCodecPreferences([...h264, ...rest]);
+      }
+
       function buildWhipUrl(streamKey) {
         return `${proxyBase}/whip/v1?stream_key=${encodeURIComponent(streamKey)}`;
       }
 
       function buildWhepUrl(streamKey) {
         return `${proxyBase}/whep/v1?stream_key=${encodeURIComponent(streamKey)}`;
+      }
+
+      function buildNativeWhepOfferUrl(streamKey) {
+        return `${proxyBase}/whep/offer/v1?stream_key=${encodeURIComponent(streamKey)}`;
       }
 
       function normalizeWebRtcUrl(rawUrl, fallbackUrl) {
@@ -210,6 +258,30 @@
         return parsed.toString();
       }
 
+      function streamKeyFromWebRtcUrl(rawUrl, fallbackStreamKey) {
+        const candidate = (rawUrl || "").trim();
+        if (!candidate) {
+          return fallbackStreamKey;
+        }
+        let parsed;
+        try {
+          parsed = new URL(candidate, window.location.origin);
+        } catch (_error) {
+          return fallbackStreamKey;
+        }
+
+        const directKey = parsed.searchParams.get("stream_key");
+        if (directKey) {
+          return directKey;
+        }
+        const app = parsed.searchParams.get("app");
+        const stream = parsed.searchParams.get("stream");
+        if (app && stream) {
+          return `${app}/${stream}`;
+        }
+        return fallbackStreamKey;
+      }
+
       function syncPublishUrl() {
         const streamKey = whipStreamKeyInput.value.trim() || "live/webrtc-demo";
         whipPublishUrlInput.value = buildWhipUrl(streamKey);
@@ -217,24 +289,34 @@
 
       function syncPlayUrl() {
         const streamKey = whepStreamKeyInput.value.trim() || "live/webrtc-demo";
-        whepPlayUrlInput.value = buildWhepUrl(streamKey);
+        whepPlayUrlInput.value = isNativeRuntime() ? buildNativeWhepOfferUrl(streamKey) : buildWhepUrl(streamKey);
       }
 
       function getPublishTarget() {
-        const streamKey = whipStreamKeyInput.value.trim();
+        const inputStreamKey = whipStreamKeyInput.value.trim();
         const url = normalizeWebRtcUrl(
           whipPublishUrlInput.value,
-          buildWhipUrl(streamKey)
+          buildWhipUrl(inputStreamKey)
         );
+        const streamKey = streamKeyFromWebRtcUrl(url, inputStreamKey);
+        if (streamKey && streamKey !== inputStreamKey) {
+          whipStreamKeyInput.value = streamKey;
+          syncPublishUrl();
+        }
         return { streamKey, url };
       }
 
       function getPlayTarget() {
-        const streamKey = whepStreamKeyInput.value.trim();
+        const inputStreamKey = whepStreamKeyInput.value.trim();
         const url = normalizeWebRtcUrl(
           whepPlayUrlInput.value,
-          buildWhepUrl(streamKey)
+          buildWhepUrl(inputStreamKey)
         );
+        const streamKey = streamKeyFromWebRtcUrl(url, inputStreamKey);
+        if (streamKey && streamKey !== inputStreamKey) {
+          whepStreamKeyInput.value = streamKey;
+          syncPlayUrl();
+        }
         return { streamKey, url };
       }
 
@@ -250,11 +332,40 @@
         if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
           throw new Error("getUserMedia unavailable in this browser context; use HTTPS or localhost");
         }
-        publishStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+        const constraints = {
+          video: {
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
+            frameRate: { ideal: 30, max: 30 }
+          },
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true
+          }
+        };
+        publishStream = await navigator.mediaDevices.getUserMedia(constraints);
         document.getElementById("localVideo").srcObject = publishStream;
 
         publishPc = new RTCPeerConnection();
-        publishStream.getTracks().forEach((track) => publishPc.addTrack(track, publishStream));
+        const videoTrack = publishStream.getVideoTracks()[0];
+        if (videoTrack) {
+          const videoTransceiver = publishPc.addTransceiver(videoTrack, {
+            direction: "sendonly",
+            streams: [publishStream],
+            sendEncodings: [{ maxBitrate: 2500000, maxFramerate: 30 }]
+          });
+          preferH264(videoTransceiver);
+          const parameters = videoTransceiver.sender.getParameters();
+          parameters.degradationPreference = "maintain-framerate";
+          if (!parameters.encodings || !parameters.encodings.length) {
+            parameters.encodings = [{}];
+          }
+          parameters.encodings[0].maxBitrate = 2500000;
+          parameters.encodings[0].maxFramerate = 30;
+          await videoTransceiver.sender.setParameters(parameters).catch(() => {});
+        }
+        publishStream.getAudioTracks().forEach((track) => publishPc.addTrack(track, publishStream));
 
         const offer = await publishPc.createOffer();
         await publishPc.setLocalDescription(offer);
@@ -298,16 +409,59 @@
       }
 
       async function startPlay() {
+        if (playPc || playSessionUrl) {
+          await stopPlay();
+        }
         const { streamKey, url } = getPlayTarget();
         playPc = new RTCPeerConnection();
-        playPc.addTransceiver("video", { direction: "recvonly" });
-        playPc.addTransceiver("audio", { direction: "recvonly" });
+        playStream = new MediaStream();
+        const remoteVideo = document.getElementById("remoteVideo");
+        remoteVideo.srcObject = playStream;
+        document.getElementById("playStatus").textContent = "Starting...";
 
         playPc.ontrack = (event) => {
-          const [stream] = event.streams;
-          document.getElementById("remoteVideo").srcObject = stream;
+          if (playStream && !playStream.getTracks().some((track) => track.id === event.track.id)) {
+            playStream.addTrack(event.track);
+          }
+          remoteVideo.play().catch(() => {});
         };
 
+        await ensureRuntimeStatus();
+        if (isNativeRuntime()) {
+          const offerUrl = buildNativeWhepOfferUrl(streamKey);
+          const offerResponse = await fetch(offerUrl, { method: "GET" });
+          if (!offerResponse.ok) {
+            const text = await offerResponse.text();
+            throw new Error(text || `native WHEP offer failed: ${offerResponse.status}`);
+          }
+          const offerSdp = await offerResponse.text();
+          const location = offerResponse.headers.get("Location");
+          playSessionUrl = location ? `${proxyBase}${location}` : null;
+          if (!playSessionUrl) {
+            throw new Error("native WHEP offer did not return a session URL");
+          }
+
+          await playPc.setRemoteDescription({ type: "offer", sdp: offerSdp });
+          const answer = await playPc.createAnswer();
+          await playPc.setLocalDescription(answer);
+          await waitIceComplete(playPc);
+
+          const answerResponse = await fetch(`${playSessionUrl}/answer`, {
+            method: "POST",
+            headers: { "Content-Type": "application/sdp" },
+            body: playPc.localDescription.sdp
+          });
+          if (!answerResponse.ok) {
+            const text = await answerResponse.text();
+            throw new Error(text || `native WHEP answer failed: ${answerResponse.status}`);
+          }
+          document.getElementById("playStatus").textContent = `Playing ${streamKey}`;
+          log("Native WHEP playback established", { streamKey, offerUrl, sessionUrl: playSessionUrl });
+          return;
+        }
+
+        preferH264(playPc.addTransceiver("video", { direction: "recvonly" }));
+        playPc.addTransceiver("audio", { direction: "recvonly" });
         const offer = await playPc.createOffer();
         await playPc.setLocalDescription(offer);
         await waitIceComplete(playPc);
@@ -335,12 +489,18 @@
       async function stopPlay() {
         if (playSessionUrl) {
           await fetch(playSessionUrl, { method: "DELETE" }).catch(() => {});
+          playSessionUrl = null;
         }
         if (playPc) {
           playPc.close();
           playPc = null;
         }
-        document.getElementById("remoteVideo").srcObject = null;
+        const remoteVideo = document.getElementById("remoteVideo");
+        remoteVideo.pause();
+        remoteVideo.srcObject = null;
+        remoteVideo.removeAttribute("src");
+        remoteVideo.load();
+        playStream = null;
         document.getElementById("playStatus").textContent = "Stopped";
       }
 
@@ -370,6 +530,7 @@
       syncPublishUrl();
       syncPlayUrl();
       updateSecurityHint();
+      loadRuntimeStatus();
     </script>
   </body>
 </html>

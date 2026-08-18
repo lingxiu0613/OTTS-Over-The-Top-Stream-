@@ -1,8 +1,11 @@
 import crypto from "crypto";
 import dgram from "dgram";
 import fs from "fs/promises";
+import http from "http";
+import https from "https";
 import net from "net";
 import { spawn } from "child_process";
+import { buildRtmpUrl, isStreamTokenAuthorizedFromUri } from "./rtmp_url.js";
 import { URLSearchParams } from "url";
 
 function normalizeRtspMount(value) {
@@ -138,6 +141,7 @@ export class RtspPublishServer {
     this.apiBase = options.apiBase || "http://127.0.0.1:8080";
     this.rtmpBase = options.rtmpBase || "rtmp://127.0.0.1:1935";
     this.ffmpegBin = options.ffmpegBin || "ffmpeg";
+    this.defaultPublishMode = options.defaultPublishMode || "core-direct-flv";
     this.server = null;
     this.connections = new Set();
     this.activeSessions = new Map();
@@ -175,6 +179,13 @@ export class RtspPublishServer {
       packets_received: session.packetCount,
       bytes_received: session.byteCount,
       ffmpeg_pid: session.ffmpeg?.pid || null,
+      publish_mode: session.publishMode || this.defaultPublishMode,
+      stdout_chunks: session.stdoutChunks || 0,
+      stdout_bytes: session.stdoutBytes || 0,
+      parsed_tags: session.parsedTags || 0,
+      media_packets: session.mediaPackets || 0,
+      media_bytes: session.mediaBytes || 0,
+      last_media_timestamp: session.lastMediaTimestamp || 0,
       announced_at: session.announcedAt,
       record_started_at: session.recordStartedAt || null
     }));
@@ -196,6 +207,8 @@ export class RtspPublishServer {
     if (!connection.streamKey || !connection.streamPath) {
       return;
     }
+    const publishMode = connection.publishMode || this.defaultPublishMode;
+    const isCoreDirect = publishMode === "core-direct-flv";
     const params = new URLSearchParams({
       session_key: this.sessionKey(connection),
       stream_key: connection.streamKey,
@@ -205,7 +218,11 @@ export class RtspPublishServer {
       state: stateOverride || connection.state || "connected",
       public_url: this.publicUrl(connection),
       bind_url: this.bindUrl(connection),
-      target_url: `${this.rtmpBase}/${connection.streamKey}`,
+      target_url: isCoreDirect ? `${this.apiBase}/api/internal/media/publish/flv-stream` : `${this.rtmpBase}/${connection.streamKey}`,
+      transport: "rtsp/rtp-udp",
+      media_path: isCoreDirect ? "rtsp-ffmpeg-flv-stream-core-parser" : "rtsp-native-control+ffmpeg-rtmp-bridge",
+      native_stage: isCoreDirect ? "core-direct" : "native-control",
+      codec_hint: "h264",
       pid: String(connection.ffmpeg?.pid || 0),
       started_at_epoch_ms: connection.recordStartedAt ? String(Date.parse(connection.recordStartedAt)) : "0",
       last_stopped_at_epoch_ms: stateOverride === "closed" ? String(Date.now()) : "0",
@@ -251,7 +268,15 @@ export class RtspPublishServer {
       state: "connected",
       announcedAt: null,
       recordStartedAt: null,
-      lastError: ""
+      lastError: "",
+      authorized: false,
+      publishMode: this.defaultPublishMode,
+      stdoutChunks: 0,
+      stdoutBytes: 0,
+      parsedTags: 0,
+      mediaPackets: 0,
+      mediaBytes: 0,
+      lastMediaTimestamp: 0
     };
     this.connections.add(connection);
 
@@ -331,6 +356,95 @@ export class RtspPublishServer {
     }
   }
 
+  async publishMediaToCore(streamKey, message) {
+    const params = new URLSearchParams({
+      stream_key: streamKey,
+      source_protocol: "rtsp",
+      managed_by: "node-rtsp-native-publish",
+      message_type: String(message.typeId),
+      timestamp: String(message.timestamp || 0),
+      message_stream_id: String(message.messageStreamId || 1),
+      payload_encoding: "raw"
+    });
+    const payload = Buffer.from(message.payload || []);
+    if (!payload.length) {
+      return;
+    }
+    const response = await fetch(`${this.apiBase}/api/internal/media/publish?${params.toString()}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/octet-stream",
+        "Content-Length": String(payload.length)
+      },
+      body: payload
+    });
+    if (!response.ok) {
+      throw new Error(`core media publish failed: ${response.status} ${await response.text()}`);
+    }
+  }
+
+  async publishFlvChunkToCore(streamKey, chunk) {
+    const payload = Buffer.from(chunk || []);
+    if (!payload.length) {
+      return { parsed_tags: 0, media_packets: 0, media_bytes: 0, last_media_timestamp: 0 };
+    }
+    const params = new URLSearchParams({
+      stream_key: streamKey,
+      source_protocol: "rtsp",
+      managed_by: "node-rtsp-native-publish"
+    });
+    const response = await fetch(`${this.apiBase}/api/internal/media/publish/flv-chunk?${params.toString()}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/octet-stream",
+        "Content-Length": String(payload.length)
+      },
+      body: payload
+    });
+    if (!response.ok) {
+      throw new Error(`core flv chunk publish failed: ${response.status} ${await response.text()}`);
+    }
+    return response.json();
+  }
+
+
+  openFlvStreamToCore(streamKey) {
+    const params = new URLSearchParams({
+      stream_key: streamKey,
+      source_protocol: "rtsp",
+      managed_by: "node-rtsp-native-publish"
+    });
+    const target = new URL(`${this.apiBase}/api/internal/media/publish/flv-stream?${params.toString()}`);
+    const client = target.protocol === "https:" ? https : http;
+    const request = client.request(target, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/octet-stream",
+        "Transfer-Encoding": "chunked"
+      }
+    });
+    const done = new Promise((resolve, reject) => {
+      request.on("response", (response) => {
+        const chunks = [];
+        response.on("data", (chunk) => chunks.push(chunk));
+        response.on("end", () => {
+          const text = Buffer.concat(chunks).toString("utf8");
+          if (response.statusCode < 200 || response.statusCode >= 300) {
+            reject(new Error(`core flv stream failed: ${response.statusCode} ${text}`));
+            return;
+          }
+          try {
+            resolve(JSON.parse(text || "{}"));
+          } catch (error) {
+            reject(error);
+          }
+        });
+      });
+      request.on("error", reject);
+    });
+    return { request, done };
+  }
+
   async ensureReceiverProcess(connection) {
     if (!connection.sdp || !connection.serverPorts) {
       throw new Error("ANNOUNCE and SETUP are required before starting receiver");
@@ -361,42 +475,90 @@ export class RtspPublishServer {
       connection.portHoldRtcp = null;
     }
 
-    const rtmpUrl = `${this.rtmpBase}/${connection.streamKey}`;
-    connection.ffmpeg = spawn(
-      this.ffmpegBin,
-      [
-        "-hide_banner",
-        "-loglevel",
-        "info",
-        "-protocol_whitelist",
-        "file,udp,rtp",
-        "-fflags",
-        "+genpts",
-        "-analyzeduration",
-        "10000000",
-        "-probesize",
-        "5000000",
-        "-i",
-        connection.sdpPath,
-        "-an",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-tune",
-        "zerolatency",
-        "-pix_fmt",
-        "yuv420p",
-        "-g",
-        "50",
-        "-bf",
-        "0",
-        "-f",
-        "flv",
-        rtmpUrl
-      ],
-      { stdio: ["ignore", "ignore", "pipe"] }
-    );
+    connection.publishMode = connection.publishMode || this.defaultPublishMode;
+    connection.stdoutChunks = 0;
+    connection.stdoutBytes = 0;
+    connection.parsedTags = 0;
+    connection.mediaPackets = 0;
+    connection.mediaBytes = 0;
+    connection.lastMediaTimestamp = 0;
+
+    const publishMode = connection.publishMode;
+    const isCoreDirect = publishMode === "core-direct-flv";
+    let coreStream = null;
+    let pendingStdout = [];
+    const attachCoreStreamHandlers = () => {
+      if (!coreStream) {
+        return;
+      }
+      coreStream.done
+        .then((result) => {
+          connection.parsedTags += Number(result.parsed_tags || 0);
+          connection.mediaPackets += Number(result.media_packets || 0);
+          connection.mediaBytes += Number(result.media_bytes || 0);
+          if (result.last_media_timestamp !== undefined) {
+            connection.lastMediaTimestamp = Number(result.last_media_timestamp || 0);
+          }
+        })
+        .catch((error) => {
+          connection.lastError = error instanceof Error ? error.message : String(error);
+          if (connection.ffmpeg && !connection.ffmpeg.killed) {
+            connection.ffmpeg.kill("SIGTERM");
+          }
+        });
+    };
+    const writeToCoreStream = (chunk) => {
+      if (!coreStream) {
+        pendingStdout.push(Buffer.from(chunk));
+        return;
+      }
+      const canContinue = coreStream.request.write(chunk);
+      if (!canContinue && connection.ffmpeg?.stdout) {
+        connection.ffmpeg.stdout.pause();
+        coreStream.request.once("drain", () => connection.ffmpeg?.stdout?.resume());
+      }
+    };
+    if (isCoreDirect) {
+      coreStream = this.openFlvStreamToCore(connection.streamKey);
+      attachCoreStreamHandlers();
+    }
+    const outputTarget = isCoreDirect ? "pipe:1" : buildRtmpUrl(this.rtmpBase, connection.streamKey, "publish");
+    const ffmpegArgs = [
+      "-hide_banner",
+      "-loglevel",
+      "info",
+      "-protocol_whitelist",
+      "file,udp,rtp",
+      "-fflags",
+      "+genpts",
+      "-analyzeduration",
+      "10000000",
+      "-probesize",
+      "5000000",
+      "-i",
+      connection.sdpPath,
+      "-an",
+      "-c:v",
+      "libx264",
+      "-preset",
+      "veryfast",
+      "-tune",
+      "zerolatency",
+      "-pix_fmt",
+      "yuv420p",
+      "-g",
+      "50",
+      "-bf",
+      "0",
+      "-flvflags",
+      "no_duration_filesize",
+      "-f",
+      "flv",
+      outputTarget
+    ];
+    connection.ffmpeg = spawn(this.ffmpegBin, ffmpegArgs, {
+      stdio: ["ignore", isCoreDirect ? "pipe" : "ignore", "pipe"]
+    });
     let startupRejected = false;
     let startupTimer = null;
     let startupResolve = null;
@@ -410,6 +572,12 @@ export class RtspPublishServer {
     }, 400);
     connection.ffmpeg.once("spawn", () => {
       connection.state = "receiver-starting";
+      if (isCoreDirect && pendingStdout.length) {
+        for (const pendingChunk of pendingStdout) {
+          writeToCoreStream(pendingChunk);
+        }
+        pendingStdout = [];
+      }
       this.syncCoreSession(connection).catch(() => {
         // best effort
       });
@@ -420,6 +588,14 @@ export class RtspPublishServer {
       }
       startupRejected = true;
       startupReject(error);
+    });
+    connection.ffmpeg.stdout?.on("data", (chunk) => {
+      connection.stdoutChunks += 1;
+      connection.stdoutBytes += chunk.length;
+      if (!isCoreDirect) {
+        return;
+      }
+      writeToCoreStream(chunk);
     });
     connection.ffmpeg.stderr.on("data", (chunk) => {
       const text = chunk.toString("utf8").trim();
@@ -434,6 +610,9 @@ export class RtspPublishServer {
       if (!startupRejected) {
         startupRejected = true;
         startupReject(new Error("rtsp publish receiver exited"));
+      }
+      if (coreStream) {
+        coreStream.request.end();
       }
       connection.state = "closed";
       await this.upsertStream(connection.streamKey, false);
@@ -489,6 +668,16 @@ export class RtspPublishServer {
       if (connection.streamPath) {
         connection.streamKey = streamKeyFromUri(uri);
       }
+    }
+
+    if (!connection.authorized) {
+      const authStreamKey = connection.streamKey || streamKeyFromUri(uri);
+      if (!isStreamTokenAuthorizedFromUri(uri, "publish", authStreamKey)) {
+        connection.state = "unauthorized";
+        this.send(connection, "401 Unauthorized", baseHeaders);
+        return;
+      }
+      connection.authorized = true;
     }
 
     if (method === "ANNOUNCE") {

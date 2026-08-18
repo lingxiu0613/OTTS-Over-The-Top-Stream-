@@ -1,5 +1,7 @@
 #include "otts/rtmp/rtmp_session.hpp"
 
+#include "otts/auth/stream_auth.hpp"
+
 #include "otts/core/logger.hpp"
 #include "otts/rtmp/amf0.hpp"
 
@@ -9,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <sstream>
@@ -38,6 +41,55 @@ ssize_t send_without_sigpipe(int socket_fd, const void* data, std::size_t size) 
 #else
     return ::send(socket_fd, data, size, 0);
 #endif
+}
+
+std::string url_decode(const std::string& value) {
+    std::string decoded;
+    decoded.reserve(value.size());
+    for (std::size_t i = 0; i < value.size(); ++i) {
+        if (value[i] == '%' && i + 2 < value.size()) {
+            const auto hex = value.substr(i + 1, 2);
+            const auto decoded_char = static_cast<char>(std::strtol(hex.c_str(), nullptr, 16));
+            decoded.push_back(decoded_char);
+            i += 2;
+        } else if (value[i] == '+') {
+            decoded.push_back(' ');
+        } else {
+            decoded.push_back(value[i]);
+        }
+    }
+    return decoded;
+}
+
+std::string strip_query(std::string value) {
+    const auto query_pos = value.find('?');
+    if (query_pos != std::string::npos) {
+        value.resize(query_pos);
+    }
+    return value;
+}
+
+std::string query_param(const std::string& value, const std::string& key) {
+    const auto query_pos = value.find('?');
+    if (query_pos == std::string::npos) {
+        return {};
+    }
+    const auto query = value.substr(query_pos + 1);
+    std::size_t offset = 0;
+    while (offset <= query.size()) {
+        const auto amp = query.find('&', offset);
+        const auto part = query.substr(offset, amp == std::string::npos ? std::string::npos : amp - offset);
+        const auto eq = part.find('=');
+        const auto name = eq == std::string::npos ? part : part.substr(0, eq);
+        if (url_decode(name) == key) {
+            return eq == std::string::npos ? std::string{} : url_decode(part.substr(eq + 1));
+        }
+        if (amp == std::string::npos) {
+            break;
+        }
+        offset = amp + 1;
+    }
+    return {};
 }
 
 std::string join_stream_key(const std::string& app_name, const std::string& stream_name) {
@@ -89,20 +141,23 @@ std::string get_publish_stream_name(const std::vector<Amf0Value>& values) {
 std::pair<std::string, std::string> normalize_publish_target(
     const std::string& app_name,
     const std::string& stream_name) {
-    const auto slash_pos = app_name.find('/');
+    const auto clean_app_name = strip_query(app_name);
+    const auto clean_stream_name = strip_query(stream_name);
+    const auto slash_pos = clean_app_name.find('/');
     if (slash_pos == std::string::npos) {
-        return {app_name, stream_name};
+        return {clean_app_name, clean_stream_name};
     }
 
-    const auto app = app_name.substr(0, slash_pos);
-    const auto suffix = app_name.substr(slash_pos + 1);
+    const auto app = clean_app_name.substr(0, slash_pos);
+    const auto suffix = clean_app_name.substr(slash_pos + 1);
 
     // OBS may send app as "live/stream" and publish type as the last argument.
-    if (stream_name.empty() || stream_name == "live" || stream_name == "record" || stream_name == "append") {
+    if (clean_stream_name.empty() || clean_stream_name == "live" || clean_stream_name == "record" ||
+        clean_stream_name == "append") {
         return {app, suffix};
     }
 
-    return {app, stream_name};
+    return {app, clean_stream_name};
 }
 
 }  // namespace
@@ -392,7 +447,11 @@ void RtmpSession::on_connect(const std::vector<Amf0Value>& values) {
         if (const auto* object = std::get_if<Amf0Object>(&values[2])) {
             auto it = object->properties.find("app");
             if (it != object->properties.end()) {
-                app_name_ = as_string(it->second);
+                const auto raw_app = as_string(it->second);
+                connect_token_ = query_param(raw_app, "token");
+                connect_expires_ = query_param(raw_app, "expires");
+                connect_signature_ = query_param(raw_app, "sign");
+                app_name_ = strip_query(raw_app);
             }
 
             if (app_name_.empty()) {
@@ -402,7 +461,17 @@ void RtmpSession::on_connect(const std::vector<Amf0Value>& values) {
                     const auto scheme_pos = tc_url.find("://");
                     const auto path_pos = tc_url.find('/', scheme_pos == std::string::npos ? 0 : scheme_pos + 3);
                     if (path_pos != std::string::npos && path_pos + 1 < tc_url.size()) {
-                        app_name_ = tc_url.substr(path_pos + 1);
+                        const auto raw_app = tc_url.substr(path_pos + 1);
+                        if (connect_token_.empty()) {
+                            connect_token_ = query_param(raw_app, "token");
+                        }
+                        if (connect_expires_.empty()) {
+                            connect_expires_ = query_param(raw_app, "expires");
+                        }
+                        if (connect_signature_.empty()) {
+                            connect_signature_ = query_param(raw_app, "sign");
+                        }
+                        app_name_ = strip_query(raw_app);
                     }
                 }
             }
@@ -460,6 +529,18 @@ void RtmpSession::on_create_stream(const std::vector<Amf0Value>& values) {
 
 void RtmpSession::on_publish(const MediaMessage& message, const std::vector<Amf0Value>& values) {
     const auto raw_stream_name = get_publish_stream_name(values);
+    auto supplied_token = query_param(raw_stream_name, "token");
+    auto supplied_expires = query_param(raw_stream_name, "expires");
+    auto supplied_signature = query_param(raw_stream_name, "sign");
+    if (supplied_token.empty()) {
+        supplied_token = connect_token_;
+    }
+    if (supplied_expires.empty()) {
+        supplied_expires = connect_expires_;
+    }
+    if (supplied_signature.empty()) {
+        supplied_signature = connect_signature_;
+    }
     const auto [normalized_app, normalized_stream] = normalize_publish_target(app_name_, raw_stream_name);
     otts::core::log_info(
         "rtmp_session",
@@ -469,6 +550,11 @@ void RtmpSession::on_publish(const MediaMessage& message, const std::vector<Amf0
         "resolved publish app=" + normalized_app + " stream=" + normalized_stream);
     stream_key_ = join_stream_key(normalized_app, normalized_stream);
     otts::core::log_info("rtmp_session", "normalized publish key=" + stream_key_);
+    if (!is_stream_authorized("publish", stream_key_, supplied_token, supplied_expires, supplied_signature)) {
+        otts::core::log_warn("rtmp_session", "reject unauthorized publish key=" + stream_key_ + " client=" + client_ip_);
+        reject_stream(message.message_stream_id, "NetStream.Publish.BadName", "Unauthorized publish credentials.");
+        return;
+    }
     is_publisher_ = true;
     registry_.register_publisher(stream_key_, shared_from_this());
 
@@ -482,11 +568,28 @@ void RtmpSession::on_publish(const MediaMessage& message, const std::vector<Amf0
 
 void RtmpSession::on_play(const MediaMessage& message, const std::vector<Amf0Value>& values) {
     const auto stream_name = get_play_stream_name(values);
+    auto supplied_token = query_param(stream_name, "token");
+    auto supplied_expires = query_param(stream_name, "expires");
+    auto supplied_signature = query_param(stream_name, "sign");
+    if (supplied_token.empty()) {
+        supplied_token = connect_token_;
+    }
+    if (supplied_expires.empty()) {
+        supplied_expires = connect_expires_;
+    }
+    if (supplied_signature.empty()) {
+        supplied_signature = connect_signature_;
+    }
     otts::core::log_info(
         "rtmp_session",
-        "handle play app=" + app_name_ + " stream=" + stream_name);
-    stream_key_ = join_stream_key(app_name_, stream_name);
+        "handle play app=" + app_name_ + " stream=" + strip_query(stream_name));
+    stream_key_ = join_stream_key(app_name_, strip_query(stream_name));
     otts::core::log_info("rtmp_session", "normalized play key=" + stream_key_);
+    if (!is_stream_authorized("play", stream_key_, supplied_token, supplied_expires, supplied_signature)) {
+        otts::core::log_warn("rtmp_session", "reject unauthorized play key=" + stream_key_ + " client=" + client_ip_);
+        reject_stream(message.message_stream_id, "NetStream.Play.Failed", "Unauthorized play credentials.");
+        return;
+    }
     is_player_ = true;
     play_stream_id_ = message.message_stream_id;
     registry_.add_subscriber(stream_key_, shared_from_this());
@@ -601,6 +704,20 @@ void RtmpSession::send_on_status(std::uint32_t stream_id, const std::string& cod
     message.message_stream_id = stream_id;
     message.payload = writer.data();
     send_chunked_message(5, message);
+}
+
+bool RtmpSession::is_stream_authorized(
+    const std::string& action,
+    const std::string& stream_key,
+    const std::string& supplied_token,
+    const std::string& expires,
+    const std::string& signature) const {
+    return otts::auth::is_authorized(action, stream_key, supplied_token, expires, signature);
+}
+
+void RtmpSession::reject_stream(std::uint32_t stream_id, const std::string& code, const std::string& description) {
+    send_on_status(stream_id, code, description);
+    stop();
 }
 
 void RtmpSession::send_command_result(double transaction_id, const Amf0Object& properties, const Amf0Object& info) {

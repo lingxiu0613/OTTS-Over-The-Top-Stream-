@@ -188,7 +188,7 @@
     <main>
       <div class="hero">
         <h1>OTTS Debug Panel</h1>
-        <p class="muted">OTTS: Over-The-Top Stream. Current focus as of August 13, 2026: stable RTMP/HTTP-FLV/HLS plus the first WHIP/WHEP session scaffold.</p>
+        <p class="muted">OTTS: Over-The-Top Stream. Native protocol path: RTMP/FLV/HLS, RTSP play, SRT publish/play, and WHIP/WHEP all converge on the C++ stream registry.</p>
         <p><a href="/webrtc.html" style="color:#fdba74;">Open WHIP/WHEP browser test page</a></p>
       </div>
 
@@ -206,10 +206,11 @@
           <div class="stat"><div class="muted">Control API Base</div><strong id="apiBase">-</strong></div>
           <div class="stat"><div class="muted">HLS Root</div><strong id="hlsRoot">-</strong></div>
           <div class="stat"><div class="muted">WebRTC Gateway</div><strong id="webrtcGateway">-</strong></div>
+          <div class="stat"><div class="muted">WebRTC Runtime</div><strong id="webrtcRuntime">-</strong></div>
           <div class="stat"><div class="muted">Managed Services</div><strong id="managedProcesses">-</strong></div>
           <div class="stat"><div class="muted">RTSP Native Publish</div><strong id="rtspNativePublish">-</strong></div>
           <div class="stat"><div class="muted">RTSP Native Recording</div><strong id="rtspNativeRecording">-</strong></div>
-          <div class="stat"><div class="muted">RTSP Compat Desired</div><strong id="rtspCompatDesired">-</strong></div>
+          <div class="stat"><div class="muted">Native Protocol Mode</div><strong id="nativeProtocolMode">-</strong></div>
           <div class="stat"><div class="muted">SRT Sessions</div><strong id="srtSessions">-</strong></div>
           <div class="stat"><div class="muted">SRT Publish/Play</div><strong id="srtPublishPlay">-</strong></div>
           <div class="stat"><div class="muted">SRT Running</div><strong id="srtRunning">-</strong></div>
@@ -237,7 +238,7 @@
 
       <div class="card">
         <h2>Core Protocol Sessions</h2>
-        <p class="muted">These records come from the C++ core API and now hold SRT and RTSP compatibility session state in one place.</p>
+        <p class="muted">These records come from the C++ core API and show native protocol sessions sharing one stream registry, track state, and GOP cache.</p>
         <table>
           <thead>
             <tr>
@@ -278,7 +279,7 @@
 
       <div class="card">
         <h2>WHIP/WHEP Sessions</h2>
-        <p class="muted">The Python gateway on port 8081 handles the current WHIP/WHEP media transport. Publish first, then subscribe with the same stream key.</p>
+        <p class="muted">WHIP/WHEP is served by the native C++ WebRTC path when the runtime is native. Python remains only as an optional fallback/tooling path.</p>
         <table>
           <thead>
             <tr>
@@ -297,13 +298,13 @@
       </div>
 
       <div class="card">
-        <h2>RTSP Ingest</h2>
-        <p class="muted">Legacy helper path. This ffmpeg RTSP pull relay still exists for camera pull experiments, but OTTS is now prioritizing native RTSP publish/play on `:8554/:8556` below.</p>
+        <h2>RTSP Pull Relay</h2>
+        <p class="muted">Compatibility pull relay is disabled in native protocol mode. Use native RTSP push on `:8554` and native RTSP play on `:8556`.</p>
         <p><input id="rtspSourceUrl" placeholder="rtsp://user:pass@camera.example/live" /></p>
         <p><input id="rtspStreamKey" value="live/rtsp-demo" /></p>
         <p>
-          <button id="rtspStartBtn">Start RTSP Relay</button>
-          <button id="rtspStopBtn" class="secondary">Stop RTSP Relay</button>
+          <button id="rtspStartBtn" disabled>Compat Relay Disabled</button>
+          <button id="rtspStopBtn" class="secondary" disabled>No Worker</button>
         </p>
         <table>
           <thead>
@@ -323,14 +324,14 @@
       </div>
 
       <div class="card">
-        <h2>SRT Ingest/Egress</h2>
-        <p class="muted">Phase-2 SRT path uses Node-managed ffmpeg workers with libsrt. Publish into OTTS through the SRT listener, then play back through the SRT output listener backed by the RTMP core.</p>
+        <h2>SRT Native Ingest/Egress</h2>
+        <p class="muted">SRT publish and play are handled directly by the C++ core on the configured SRT ports.</p>
         <p><input id="srtStreamKey" value="live/srt-demo" /></p>
         <p>
-          <button id="srtStartBtn">Start SRT Publish+Play</button>
-          <button id="srtStartPublishBtn" class="secondary">Start Publish Only</button>
-          <button id="srtStartPlayBtn" class="secondary">Start Play Only</button>
-          <button id="srtStopBtn" class="secondary">Stop Both</button>
+          <button id="srtStartBtn" disabled>Native Listener Always On</button>
+          <button id="srtStartPublishBtn" class="secondary" disabled>No Worker</button>
+          <button id="srtStartPlayBtn" class="secondary" disabled>No Worker</button>
+          <button id="srtStopBtn" class="secondary" disabled>Core Managed</button>
         </p>
         <table>
           <thead>
@@ -351,14 +352,14 @@
       </div>
 
       <div class="card">
-        <h2>RTSP Compatibility</h2>
-        <p class="muted">OTTS now exposes native RTSP publish/play endpoints managed by the Node control plane and backed by the C++ RTMP core. Use this area to inspect desired compat routes and active native publish sessions.</p>
+        <h2>RTSP Native Endpoints</h2>
+        <p class="muted">Compatibility worker controls are disabled. RTSP sessions are reported from the core and the native endpoint pair.</p>
         <p><input id="rtspCompatStreamKey" value="live/rtsp-compat" /></p>
         <p>
-          <button id="rtspCompatStartBtn">Start RTSP Publish+Play</button>
-          <button id="rtspCompatStartPublishBtn" class="secondary">Start Publish Only</button>
-          <button id="rtspCompatStartPlayBtn" class="secondary">Start Play Only</button>
-          <button id="rtspCompatStopBtn" class="secondary">Stop Both</button>
+          <button id="rtspCompatStartBtn" disabled>Native Endpoints Always On</button>
+          <button id="rtspCompatStartPublishBtn" class="secondary" disabled>No Worker</button>
+          <button id="rtspCompatStartPlayBtn" class="secondary" disabled>No Worker</button>
+          <button id="rtspCompatStopBtn" class="secondary" disabled>Core Managed</button>
         </p>
         <table>
           <thead>
@@ -372,10 +373,10 @@
             </tr>
           </thead>
           <tbody id="rtspCompatTable">
-            <tr><td colspan="6" class="muted">No RTSP compatibility sessions yet.</td></tr>
+            <tr><td colspan="6" class="muted">No RTSP native sessions yet.</td></tr>
           </tbody>
         </table>
-        <pre id="rtspCompatLog">No RTSP compatibility log selected.</pre>
+        <pre id="rtspCompatLog">RTSP native path is handled by the core runtime log.</pre>
       </div>
 
       <div class="two-col">
@@ -710,7 +711,7 @@
       function renderRtspCompat(sessions) {
         const tbody = document.getElementById("rtspCompatTable");
         if (!sessions.length) {
-          tbody.innerHTML = '<tr><td colspan="6" class="muted">No RTSP compatibility sessions yet.</td></tr>';
+          tbody.innerHTML = '<tr><td colspan="6" class="muted">No RTSP native sessions yet.</td></tr>';
           return;
         }
 
@@ -719,9 +720,9 @@
             <td><strong>${session.stream_key}</strong></td>
             <td><code>${session.publish_url || "-"}</code></td>
             <td><code>${session.play_url || "-"}</code></td>
-            <td>${renderWorkerState(session.publish, session.desired_publish)}</td>
-            <td>${renderWorkerState(session.play, session.desired_play)}</td>
-            <td>${session.native_publish ? `<span class="pill">${session.native_publish.state || "active"}</span><br/>client:${session.native_publish.client_address || "-"}<br/>rtp:${session.native_publish.client_rtp_port || "-"} -> ${session.native_publish.server_rtp_port || "-"}<br/>ffmpeg:${session.native_publish.ffmpeg_pid ?? "-"}` : '<span class="muted">no native publish session</span>'}</td>
+            <td>${session.native_publish ? '<span class="pill">native</span>' : renderWorkerState(session.publish, session.desired_publish)}</td>
+            <td><span class="pill">core</span></td>
+            <td>${session.native_publish ? `<span class="pill">${session.native_publish.state || "active"}</span><br/>client:${session.native_publish.client_address || "-"}<br/>rtp:${session.native_publish.client_rtp_port || "-"} -> ${session.native_publish.server_rtp_port || "-"}` : '<span class="muted">waiting for RTSP publish session</span>'}</td>
           </tr>
         `).join("");
 
@@ -737,18 +738,18 @@
       function renderSrtSessions(sessions) {
         const tbody = document.getElementById("srtTable");
         if (!sessions.length) {
-          tbody.innerHTML = '<tr><td colspan="6" class="muted">No SRT sessions yet.</td></tr>';
+          tbody.innerHTML = '<tr><td colspan="6" class="muted">Native SRT listeners are ready; no active SRT sessions yet.</td></tr>';
           return;
         }
 
         tbody.innerHTML = sessions.map((session) => `
           <tr data-srt-row="${session.stream_key}">
-            <td><strong>${session.stream_key}</strong><br/><span class="muted">pub-port:${session.publish_port}</span><br/><span class="muted">play-port:${session.play_port}</span></td>
-            <td><code>${session.publish_url || "-"}</code><br/><span class="muted">${session.publish_listener_url || "-"}</span></td>
-            <td><code>${session.play_url || "-"}</code><br/><span class="muted">${session.play_listener_url || "-"}</span></td>
-            <td>${renderWorkerState(session.publish, session.desired_publish)}</td>
-            <td>${renderWorkerState(session.play, session.desired_play)}</td>
-            <td>target:<br/><code>${session.target_rtmp_url || "-"}</code></td>
+            <td><strong>${session.stream_key}</strong><br/><span class="muted">mgr:${session.managed_by || "cpp-srt-native"}</span></td>
+            <td><code>${session.public_url || "-"}</code><br/><span class="muted"><code>${session.bind_url || "-"}</code></span></td>
+            <td><code>${session.target_url || "-"}</code></td>
+            <td><span class="pill">${session.direction === "publish" ? session.state || "native" : "listener"}</span></td>
+            <td><span class="pill">${session.direction === "play" ? session.state || "native" : "listener"}</span></td>
+            <td>updated:${formatEpochMs(session.updated_at_epoch_ms)}${session.last_error ? `<br/><span class="warn">${session.last_error}</span>` : ""}</td>
           </tr>
         `).join("");
 
@@ -928,6 +929,7 @@
         let streamsState = { streams: [] };
         let webrtcState = { sessions: [], published_streams: [] };
         let webrtcHealth = { ok: false, service: "otts-webrtc-gateway" };
+        let webrtcNative = { selected_runtime: "-", media_engine_ready: false, detail: "-" };
         let systemStatus = { managed_processes: [] };
         let rtspState = { proxies: [] };
         let rtspCompatState = { sessions: [] };
@@ -935,11 +937,12 @@
         let protocolSessionsState = { sessions: [] };
 
         try {
-          const [healthRes, streamsRes, webrtcRes, webrtcHealthRes, systemStatusRes, rtspRes, rtspCompatRes, srtRes, protocolSessionsRes] = await Promise.all([
+          const [healthRes, streamsRes, webrtcRes, webrtcHealthRes, webrtcNativeRes, systemStatusRes, rtspRes, rtspCompatRes, srtRes, protocolSessionsRes] = await Promise.all([
             fetch("/api/health"),
             fetch("/api/streams"),
             fetch("/api/webrtc/sessions"),
             fetch("/api/webrtc/health"),
+            fetch("/api/webrtc/native"),
             fetch("/api/system/status"),
             fetch("/api/rtsp/proxies"),
             fetch("/api/rtsp/compat"),
@@ -950,6 +953,7 @@
           streamsState = await streamsRes.json();
           webrtcState = await webrtcRes.json();
           webrtcHealth = await webrtcHealthRes.json();
+          webrtcNative = await webrtcNativeRes.json();
           systemStatus = await systemStatusRes.json();
           rtspState = await rtspRes.json();
           rtspCompatState = await rtspCompatRes.json();
@@ -990,8 +994,8 @@
           `${health.managedProcessOnlineCount ?? 0}/${health.managedProcessCount ?? 0}`;
         document.getElementById("rtspNativePublish").textContent = health.rtspNativePublishCount ?? 0;
         document.getElementById("rtspNativeRecording").textContent = health.rtspNativeRecordingCount ?? 0;
-        document.getElementById("rtspCompatDesired").textContent =
-          `${health.rtspCompatPublishDesiredCount ?? 0}/${health.rtspCompatPlayDesiredCount ?? 0}`;
+        document.getElementById("nativeProtocolMode").textContent =
+          (rtspCompatState.native_only || srtState.native_only) ? "native-only" : "mixed";
         document.getElementById("srtSessions").textContent = health.srtSessionCount ?? 0;
         document.getElementById("srtPublishPlay").textContent = `${health.srtPublishCount ?? 0}/${health.srtPlayCount ?? 0}`;
         document.getElementById("srtRunning").textContent =
@@ -999,8 +1003,10 @@
         document.getElementById("webrtcGateway").textContent = webrtcHealth.ok
           ? `${health.webrtcGatewayBase || "-"} OK`
           : `${health.webrtcGatewayBase || "-"} DOWN`;
+        document.getElementById("webrtcRuntime").textContent =
+          `${webrtcNative.selected_runtime || "-"} ${webrtcNative.media_engine_ready ? "ready" : "bridge"}`;
         document.getElementById("healthSummary").innerHTML = health.ok
-          ? `OTTS core is online. RTMP on <code>:${health.dataPlane.listen}</code>, C++ API on <code>:${health.http_api_port}</code>, Node debug panel on <code>:3000</code>, HLS auto-start: <code>${health.hlsAutoStart}</code>, WebRTC gateway: <code>${health.webrtcGatewayBase || "-"}</code>, managed services: <code>${health.managedProcessOnlineCount ?? 0}/${health.managedProcessCount ?? 0}</code>, RTSP desired publish/play: <code>${health.rtspCompatPublishDesiredCount ?? 0}/${health.rtspCompatPlayDesiredCount ?? 0}</code>, SRT running publish/play: <code>${health.srtPublishRunningCount ?? 0}/${health.srtPlayRunningCount ?? 0}</code>, stream sources: <code>${sourceSummary}</code>.`
+          ? `OTTS core is online. RTMP on <code>:${health.dataPlane.listen}</code>, C++ API on <code>:${health.http_api_port}</code>, Node debug panel on <code>:3000</code>, HLS auto-start: <code>${health.hlsAutoStart}</code>, WebRTC runtime: <code>${webrtcNative.selected_runtime || "-"}</code>, native protocol mode: <code>${(rtspCompatState.native_only || srtState.native_only) ? "native-only" : "mixed"}</code>, managed services: <code>${health.managedProcessOnlineCount ?? 0}/${health.managedProcessCount ?? 0}</code>, RTSP native sessions: <code>${health.rtspNativePublishCount ?? 0}</code>, SRT native sessions: <code>${srtState.summary?.native_count ?? 0}</code>, stream sources: <code>${sourceSummary}</code>.`
           : '<span class="warn">OTTS core is unreachable from Node right now.</span>';
 
         renderStreams(streamsState.streams || []);
@@ -1009,7 +1015,7 @@
         renderProtocolSessions(protocolSessionsState.sessions || []);
         renderRtspProxies(rtspState.proxies || []);
         renderRtspCompat(rtspCompatState.merged_sessions || rtspCompatState.sessions || []);
-        renderSrtSessions(srtState.sessions || []);
+        renderSrtSessions(srtState.native_only ? (srtState.native_sessions || []) : (srtState.sessions || []));
         renderSelectedStream();
       }
 
