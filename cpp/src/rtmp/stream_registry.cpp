@@ -70,14 +70,48 @@ std::uint32_t aac_sample_rate_from_index(std::uint8_t index) {
 }  // namespace
 
 void StreamRegistry::register_publisher(const std::string& stream_key, const std::shared_ptr<RtmpSession>& session) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto& stream = streams_[stream_key];
-    stream.publisher = session;
-    stream.source = otts::media::StreamSource::Rtmp;
-    stream.audio_track.kind = otts::media::MediaKind::Audio;
-    stream.video_track.kind = otts::media::MediaKind::Video;
-    otts::core::log_info("stream_registry", "registered publisher key=" + stream_key);
-    persist_state_locked();
+    std::shared_ptr<RtmpSession> previous_publisher;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto& stream = streams_[stream_key];
+        const auto existing = stream.publisher.lock();
+        if (existing && existing != session) {
+            previous_publisher = existing;
+        }
+
+        stream.publisher = session;
+        stream.source = otts::media::StreamSource::Rtmp;
+        stream.ingest_origin = otts::media::StreamSource::Rtmp;
+        stream.managed_by.clear();
+        stream.external_publisher_active = false;
+        stream.metadata.reset();
+        stream.audio_sequence_header.reset();
+        stream.video_sequence_header.reset();
+        stream.audio_track = {};
+        stream.video_track = {};
+        stream.audio_track.kind = otts::media::MediaKind::Audio;
+        stream.video_track.kind = otts::media::MediaKind::Video;
+        stream.gop_cache = {};
+        stream.total_packets = 0;
+        stream.total_bytes = 0;
+        stream.audio_packets = 0;
+        stream.audio_bytes = 0;
+        stream.video_packets = 0;
+        stream.video_bytes = 0;
+        stream.data_packets = 0;
+        stream.data_bytes = 0;
+        stream.last_media_timestamp = 0;
+        stream.last_keyframe_at_epoch_ms = 0;
+        stream.first_media_at_epoch_ms = 0;
+        stream.last_media_at_epoch_ms = 0;
+        otts::core::log_info("stream_registry", "registered publisher key=" + stream_key);
+        persist_state_locked();
+    }
+
+    if (previous_publisher) {
+        otts::core::log_warn("stream_registry", "replacing duplicate publisher key=" + stream_key);
+        previous_publisher->stop();
+    }
 }
 
 void StreamRegistry::unregister_publisher(const std::shared_ptr<RtmpSession>& session) {

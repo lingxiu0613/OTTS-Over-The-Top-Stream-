@@ -28,6 +28,9 @@ python3 "${ROOT_DIR}/python/smoke_webrtc_native.py" \
   --stream-key live/webrtc-smoke
 echo
 
+"${ROOT_DIR}/scripts/smoke_stability.sh" live/stability-smoke
+echo
+
 "${ROOT_DIR}/scripts/smoke_cleanup.sh" live/cleanup-smoke
 
 echo "[OTTS] native protocol smoke suite finished"
