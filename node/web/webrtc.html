@@ -3,46 +3,77 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>OTTS WebRTC Test</title>
+    <title>OTTS WebRTC Console</title>
     <style>
       :root {
-        --bg: #0b1220;
-        --panel: rgba(15, 23, 42, 0.95);
-        --line: #243041;
-        --text: #e5e7eb;
-        --muted: #94a3b8;
+        --bg: #f4f7fb;
+        --panel: #ffffff;
+        --surface: #f8fafc;
+        --line: #d7dee9;
+        --text: #111827;
+        --muted: #667085;
+        --blue: #2563eb;
+        --ok: #16a34a;
       }
 
       body {
         margin: 0;
-        font-family: "Segoe UI", sans-serif;
-        background: linear-gradient(180deg, #111827 0%, #0b1220 100%);
+        font-family: "Segoe UI", Arial, sans-serif;
+        background: var(--bg);
         color: var(--text);
       }
 
       main {
-        max-width: 1100px;
+        max-width: 1480px;
         margin: 0 auto;
-        padding: 24px 18px 48px;
+        padding: 20px 18px 48px;
       }
 
+      .hero,
       .card {
         background: var(--panel);
         border: 1px solid var(--line);
-        border-radius: 18px;
-        padding: 18px;
+        border-radius: 8px;
+        padding: 18px 20px;
         margin-bottom: 16px;
+        box-shadow: 0 10px 24px rgba(15, 23, 42, 0.06);
+      }
+
+      .hero {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 20px;
+      }
+
+      h1,
+      h2 {
+        margin: 0 0 14px;
+        line-height: 1.25;
+        letter-spacing: 0;
+      }
+
+      h1 {
+        font-size: 30px;
+      }
+
+      h2 {
+        font-size: 22px;
       }
 
       .grid {
         display: grid;
-        grid-template-columns: 1fr 1fr;
+        grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
         gap: 16px;
       }
 
       @media (max-width: 900px) {
         .grid {
           grid-template-columns: 1fr;
+        }
+
+        .hero {
+          display: block;
         }
       }
 
@@ -52,33 +83,38 @@
       video {
         width: 100%;
         box-sizing: border-box;
-        border-radius: 12px;
+        border-radius: 6px;
       }
 
       input {
         padding: 10px 12px;
         border: 1px solid var(--line);
-        background: #09101d;
+        background: #ffffff;
         color: var(--text);
+        overflow-wrap: anywhere;
       }
 
       button {
         border: 0;
         padding: 10px 12px;
-        background: #ea580c;
+        background: var(--blue);
         color: white;
         cursor: pointer;
         margin-top: 8px;
+        font-weight: 600;
       }
 
       button.secondary {
-        background: #334155;
+        background: #eef2f7;
+        color: var(--text);
+        border: 1px solid var(--line);
       }
 
       video {
         background: #000;
         min-height: 240px;
         margin-top: 12px;
+        border: 1px solid var(--line);
       }
 
       pre {
@@ -87,14 +123,18 @@
         overflow: auto;
         padding: 12px;
         border: 1px solid var(--line);
-        background: #09101d;
-        color: var(--text);
+        background: #0f172a;
+        color: #e5e7eb;
         white-space: pre-wrap;
         word-break: break-word;
       }
 
       .muted {
         color: var(--muted);
+      }
+
+      a {
+        color: #1d4ed8;
       }
 
       .field-label {
@@ -107,10 +147,13 @@
   </head>
   <body>
     <main>
-      <div class="card">
-        <h1>OTTS WebRTC Test</h1>
-        <p class="muted">This page tests OTTS WHIP/WHEP through the Node proxy. WHIP publishes webcam/mic into the RTMP core bridge, and WHEP plays the same stream key back from the core.</p>
-        <p class="muted" id="securityHint"></p>
+      <div class="hero">
+        <div>
+          <h1>OTTS WebRTC 测试台</h1>
+          <p class="muted">WHIP 推流、WHEP 播放和浏览器会话调试。</p>
+          <p class="muted" id="securityHint"></p>
+        </div>
+        <p><a href="/">返回管理控制台</a></p>
       </div>
 
       <div class="grid">
