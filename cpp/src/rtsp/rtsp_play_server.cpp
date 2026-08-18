@@ -283,7 +283,7 @@ public:
     std::uint16_t local_port() const { return local_port_; }
 
     void send_flv_video(const otts::rtmp::MediaMessage& message) {
-        if (socket_fd_ < 0 || message.type_id != 9 || message.payload.size() < 5) {
+        if ((!use_tcp_ && socket_fd_ < 0) || message.type_id != 9 || message.payload.size() < 5) {
             return;
         }
         const auto frame_codec = message.payload[0];
@@ -306,7 +306,7 @@ public:
     }
 
     void send_flv_aac(const otts::rtmp::MediaMessage& message) {
-        if (socket_fd_ < 0 || message.type_id != 8 || message.payload.size() <= 2) {
+        if ((!use_tcp_ && socket_fd_ < 0) || message.type_id != 8 || message.payload.size() <= 2) {
             return;
         }
         const auto sound_format = static_cast<std::uint8_t>((message.payload[0] >> 4) & 0x0f);
@@ -514,7 +514,7 @@ void RtspPlayServer::handle_client(int client_fd) {
             const auto cseq = cseq_it == request.headers.end() ? "1" : cseq_it->second;
 
             if (request.method == "OPTIONS") {
-                send_all(client_fd, response_text("200 OK", cseq, {{"Public", "OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN"}}));
+                send_all(client_fd, response_text("200 OK", cseq, {{"Public", "OPTIONS, DESCRIBE, SETUP, PLAY, PAUSE, GET_PARAMETER, SET_PARAMETER, TEARDOWN"}}));
                 continue;
             }
 
@@ -658,6 +658,16 @@ void RtspPlayServer::handle_client(int client_fd) {
                         "");
                 }
                 send_all(client_fd, response_text("200 OK", cseq, {{"Session", session_id}, {"RTP-Info", audio_setup ? "url=trackID=0;seq=0;rtptime=0,url=trackID=1;seq=0;rtptime=0" : "url=trackID=0;seq=0;rtptime=0"}}));
+                continue;
+            }
+
+            if (request.method == "PAUSE") {
+                send_all(client_fd, response_text("200 OK", cseq, {{"Session", session_id}}));
+                continue;
+            }
+
+            if (request.method == "GET_PARAMETER" || request.method == "SET_PARAMETER") {
+                send_all(client_fd, response_text("200 OK", cseq, {{"Session", session_id}}));
                 continue;
             }
 

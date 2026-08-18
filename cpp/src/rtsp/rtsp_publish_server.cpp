@@ -626,7 +626,7 @@ void RtspPublishServer::handle_client(int client_fd) {
             const auto cseq = cseq_it == request->headers.end() ? "1" : cseq_it->second;
 
             if (request->method == "OPTIONS") {
-                send_all(client_fd, response_text("200 OK", cseq, {{"Public", "OPTIONS, ANNOUNCE, SETUP, RECORD, TEARDOWN"}}));
+                send_all(client_fd, response_text("200 OK", cseq, {{"Public", "OPTIONS, ANNOUNCE, SETUP, RECORD, GET_PARAMETER, SET_PARAMETER, TEARDOWN"}}));
                 continue;
             }
             if (stream_key.empty()) {
@@ -763,6 +763,12 @@ void RtspPublishServer::handle_client(int client_fd) {
                 send_all(client_fd, response_text("200 OK", cseq, {{"Session", session_id}}));
                 continue;
             }
+
+            if (request->method == "GET_PARAMETER" || request->method == "SET_PARAMETER") {
+                send_all(client_fd, response_text("200 OK", cseq, {{"Session", session_id}}));
+                continue;
+            }
+
             if (request->method == "TEARDOWN") {
                 send_all(client_fd, response_text("200 OK", cseq, {{"Session", session_id}}));
                 cleanup();

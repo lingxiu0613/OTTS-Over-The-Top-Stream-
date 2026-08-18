@@ -44,8 +44,44 @@ for _ in $(seq 1 20); do
 done
 sleep 2
 
-echo "[OTTS] ffprobe play check:"
-timeout 12s ffprobe -hide_banner -loglevel error -show_streams -of compact=p=0:nk=1 "${PLAY_URL}" | head -n 20 || true
+echo "[OTTS] ffprobe UDP play check:"
+UDP_PROBE_OUT=/tmp/otts_rtsp_udp_probe.out
+UDP_PROBE_ERR=/tmp/otts_rtsp_udp_probe.err
+set +e
+timeout 12s ffprobe -hide_banner -loglevel error -rtsp_transport udp -show_streams -of compact=p=0:nk=1 "${PLAY_URL}" >"${UDP_PROBE_OUT}" 2>"${UDP_PROBE_ERR}"
+rc=$?
+set -e
+if [[ "${rc}" != "0" && "${rc}" != "124" ]]; then
+  cat "${UDP_PROBE_ERR}" >&2 || true
+  exit "${rc}"
+fi
+if [[ ! -s "${UDP_PROBE_OUT}" ]]; then
+  cat "${UDP_PROBE_ERR}" >&2 || true
+  echo "[OTTS] no UDP RTSP stream info received" >&2
+  exit 1
+fi
+head -n 20 "${UDP_PROBE_OUT}"
+grep -Eq 'h264|aac|opus|codec_type=' "${UDP_PROBE_OUT}"
+echo
+
+echo "[OTTS] ffprobe TCP interleaved play check:"
+TCP_PROBE_OUT=/tmp/otts_rtsp_tcp_probe.out
+TCP_PROBE_ERR=/tmp/otts_rtsp_tcp_probe.err
+set +e
+timeout 12s ffprobe -hide_banner -loglevel error -rtsp_transport tcp -show_streams -of compact=p=0:nk=1 "${PLAY_URL}" >"${TCP_PROBE_OUT}" 2>"${TCP_PROBE_ERR}"
+rc=$?
+set -e
+if [[ "${rc}" != "0" && "${rc}" != "124" ]]; then
+  cat "${TCP_PROBE_ERR}" >&2 || true
+  exit "${rc}"
+fi
+if [[ ! -s "${TCP_PROBE_OUT}" ]]; then
+  cat "${TCP_PROBE_ERR}" >&2 || true
+  echo "[OTTS] no TCP RTSP stream info received" >&2
+  exit 1
+fi
+head -n 20 "${TCP_PROBE_OUT}"
+grep -Eq 'h264|aac|opus|codec_type=' "${TCP_PROBE_OUT}"
 echo
 
 kill "${PUSH_PID}" 2>/dev/null || true

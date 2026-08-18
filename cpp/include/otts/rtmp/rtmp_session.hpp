@@ -46,6 +46,9 @@ private:
     void on_fc_publish(const std::vector<Amf0Value>& values);
     void on_fc_unpublish(const std::vector<Amf0Value>& values);
     void on_create_stream(const std::vector<Amf0Value>& values);
+    void on_get_stream_length(const std::vector<Amf0Value>& values);
+    void on_pause(const MediaMessage& message, const std::vector<Amf0Value>& values);
+    void on_seek(const MediaMessage& message, const std::vector<Amf0Value>& values);
     void on_publish(const MediaMessage& message, const std::vector<Amf0Value>& values);
     void on_play(const MediaMessage& message, const std::vector<Amf0Value>& values);
     void on_delete_stream(const std::vector<Amf0Value>& values);
@@ -57,8 +60,6 @@ private:
     void send_set_chunk_size(std::uint32_t chunk_size);
     void send_stream_begin(std::uint32_t stream_id);
     void send_on_status(std::uint32_t stream_id, const std::string& code, const std::string& description);
-    bool is_stream_authorized(const std::string& action, const std::string& stream_key, const std::string& supplied_token, const std::string& expires, const std::string& signature) const;
-    void reject_stream(std::uint32_t stream_id, const std::string& code, const std::string& description);
     void send_command_result(double transaction_id, const Amf0Object& properties, const Amf0Object& info);
     void send_simple_result(double transaction_id, const Amf0Value& value);
     void send_chunked_message(std::uint32_t chunk_stream_id, const MediaMessage& message);
@@ -81,9 +82,6 @@ private:
     std::unordered_map<std::uint32_t, ChunkState> chunk_states_;
 
     std::string app_name_;
-    std::string connect_token_;
-    std::string connect_expires_;
-    std::string connect_signature_;
     std::string stream_key_;
     bool is_publisher_{false};
     bool is_player_{false};
