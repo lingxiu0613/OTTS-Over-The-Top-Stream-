@@ -65,6 +65,16 @@ async function collectPlaylistDirs(rootDir) {
   return result;
 }
 
+function isStreamReadyForHls(stream) {
+  if (!stream || !stream.stream_key || !stream.has_publisher) {
+    return false;
+  }
+  if (stream.ready_for_play === false) {
+    return false;
+  }
+  return Boolean(stream.has_video_sequence_header || stream.video_codec === "h264");
+}
+
 export class HlsManager {
   constructor(options = {}) {
     this.ffmpegBin = options.ffmpegBin || "ffmpeg";
@@ -75,6 +85,9 @@ export class HlsManager {
     this.listSize = options.listSize || 6;
     this.idleStopMs = options.idleStopMs || 15000;
     this.cleanupAgeMs = options.cleanupAgeMs || 10 * 60 * 1000;
+    this.restartBackoffMs = options.restartBackoffMs || 5000;
+    this.playlistStaleMs = options.playlistStaleMs || 10000;
+    this.playlistStartupTimeoutMs = options.playlistStartupTimeoutMs || 20000;
     this.processes = new Map();
   }
 
@@ -96,6 +109,15 @@ export class HlsManager {
     }
     if (options.cleanupAgeSeconds) {
       this.cleanupAgeMs = Number(options.cleanupAgeSeconds) * 1000;
+    }
+    if (options.restartBackoffSeconds) {
+      this.restartBackoffMs = Number(options.restartBackoffSeconds) * 1000;
+    }
+    if (options.playlistStaleSeconds) {
+      this.playlistStaleMs = Number(options.playlistStaleSeconds) * 1000;
+    }
+    if (options.playlistStartupTimeoutSeconds) {
+      this.playlistStartupTimeoutMs = Number(options.playlistStartupTimeoutSeconds) * 1000;
     }
   }
 
@@ -127,6 +149,19 @@ export class HlsManager {
     return path.join(streamDir(this.rootDir, streamKey), "ffmpeg.log");
   }
 
+  playlistHasSegments(streamKey) {
+    try {
+      const playlist = fs.readFileSync(this.playlistPath(streamKey), "utf8");
+      const segmentLines = playlist
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter((line) => line && !line.startsWith("#"));
+      return segmentLines.some((line) => fs.existsSync(this.segmentPath(streamKey, line)));
+    } catch {
+      return false;
+    }
+  }
+
   getStatus(streamKey) {
     const proc = this.processes.get(streamKey);
     const playlist = this.playlistPath(streamKey);
@@ -143,6 +178,8 @@ export class HlsManager {
         playlistAgeMs = null;
       }
     }
+    const playlistHasSegments = exists ? this.playlistHasSegments(streamKey) : false;
+    const playlistFresh = exists && playlistAgeMs !== null && playlistAgeMs <= this.playlistStaleMs;
     return {
       stream_key: streamKey,
       hls_path: this.publicPath(streamKey),
@@ -151,6 +188,9 @@ export class HlsManager {
       master_playlist_path: this.masterPlaylistPath(streamKey),
       playlist_exists: exists,
       master_playlist_exists: fs.existsSync(this.masterPlaylistPath(streamKey)),
+      playlist_has_segments: playlistHasSegments,
+      playlist_fresh: playlistFresh,
+      playlist_ready: Boolean(exists && playlistHasSegments && playlistFresh),
       playlist_mtime_epoch_ms: playlistMtimeEpochMs,
       playlist_age_ms: playlistAgeMs,
       running: Boolean(proc && !proc.exited),
@@ -158,10 +198,12 @@ export class HlsManager {
       started_at: proc?.startedAt || null,
       last_seen_at: proc?.lastSeenAt || null,
       last_seen_epoch_ms: proc?.lastSeenEpochMs || null,
+      last_restart_attempt_epoch_ms: proc?.lastRestartAttemptEpochMs || null,
       last_exit_code: proc?.lastExitCode ?? null,
       last_error: proc?.lastError || null,
       restart_count: proc?.restartCount ?? 0,
-      auto_start: this.autoStart
+      auto_start: this.autoStart,
+      playlist_startup_timeout_ms: this.playlistStartupTimeoutMs
     };
   }
 
@@ -181,11 +223,32 @@ export class HlsManager {
     return streams.map((stream) => this.getStatus(stream.stream_key));
   }
 
-  async ensureRunning(streamKey) {
+  async ensureRunning(streamKey, streamState = null) {
     await this.ensureRoot();
     const existing = this.processes.get(streamKey);
     if (existing && !existing.exited) {
       return this.getStatus(streamKey);
+    }
+    if (streamState && !isStreamReadyForHls(streamState)) {
+      if (existing) {
+        existing.lastError = "stream not ready for HLS";
+      }
+      return {
+        ...this.getStatus(streamKey),
+        start_blocked: true,
+        last_error: "stream not ready for HLS"
+      };
+    }
+    const now = Date.now();
+    if (existing?.lastRestartAttemptEpochMs && now - existing.lastRestartAttemptEpochMs < this.restartBackoffMs) {
+      return {
+        ...this.getStatus(streamKey),
+        start_blocked: true,
+        last_error: `restart backoff ${this.restartBackoffMs}ms`
+      };
+    }
+    if (existing) {
+      existing.lastRestartAttemptEpochMs = now;
     }
 
     const outputDir = streamDir(this.rootDir, streamKey);
@@ -215,8 +278,10 @@ export class HlsManager {
         String(this.segmentSeconds),
         "-hls_list_size",
         String(this.listSize),
+        "-hls_delete_threshold",
+        "2",
         "-hls_flags",
-        "delete_segments+append_list+omit_endlist+program_date_time",
+        "delete_segments+append_list+omit_endlist+program_date_time+independent_segments+temp_file",
         "-hls_segment_filename",
         segmentPattern,
         playlistPath
@@ -233,6 +298,7 @@ export class HlsManager {
       startedEpochMs: Date.now(),
       lastSeenAt: new Date().toISOString(),
       lastSeenEpochMs: Date.now(),
+      lastRestartAttemptEpochMs: now,
       lastExitCode: null,
       lastError: null,
       restartCount: existing?.restartCount || 0,
@@ -247,6 +313,9 @@ export class HlsManager {
     child.on("exit", (code, signal) => {
       state.exited = true;
       state.lastExitCode = code;
+      if (code && code !== 0) {
+        state.lastError = `exit:${code}`;
+      }
       if (signal) {
         state.lastError = `signal:${signal}`;
       }
@@ -260,16 +329,15 @@ export class HlsManager {
 
   async waitForPlaylist(streamKey, timeoutMs = 6000) {
     const deadline = Date.now() + timeoutMs;
-    const playlist = this.playlistPath(streamKey);
 
     while (Date.now() < deadline) {
-      if (fs.existsSync(playlist)) {
+      if (this.getStatus(streamKey).playlist_ready) {
         return true;
       }
       await new Promise((resolve) => setTimeout(resolve, 250));
     }
 
-    return fs.existsSync(playlist);
+    return this.getStatus(streamKey).playlist_ready;
   }
 
   async stop(streamKey) {
@@ -309,11 +377,11 @@ export class HlsManager {
       }
       liveKeys.add(stream.stream_key);
       const existing = this.processes.get(stream.stream_key);
-      if (this.autoStart && (!existing || existing.exited)) {
+      if (this.autoStart && isStreamReadyForHls(stream) && (!existing || existing.exited)) {
         if (existing?.exited) {
           existing.restartCount = (existing.restartCount || 0) + 1;
         }
-        await this.ensureRunning(stream.stream_key);
+        await this.ensureRunning(stream.stream_key, stream);
       }
       this.markSeen(stream.stream_key);
     }

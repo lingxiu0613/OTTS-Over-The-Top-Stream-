@@ -93,7 +93,10 @@ function buildDefaultConfig(projectRoot) {
       segmentSeconds: 2,
       listSize: 6,
       idleStopSeconds: 15,
-      cleanupAgeSeconds: 600
+      cleanupAgeSeconds: 600,
+      restartBackoffSeconds: 5,
+      playlistStaleSeconds: 10,
+      playlistStartupTimeoutSeconds: 20
     },
     logging: {
       level: process.env.OTTS_LOG_LEVEL || "info",

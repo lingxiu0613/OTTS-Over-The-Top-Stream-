@@ -40,7 +40,10 @@ const hlsManager = new HlsManager({
   segmentSeconds: config.hls.segmentSeconds,
   listSize: config.hls.listSize,
   idleStopMs: Number(config.hls.idleStopSeconds || 15) * 1000,
-  cleanupAgeMs: Number(config.hls.cleanupAgeSeconds || 600) * 1000
+  cleanupAgeMs: Number(config.hls.cleanupAgeSeconds || 600) * 1000,
+  restartBackoffMs: Number(config.hls.restartBackoffSeconds || 5) * 1000,
+  playlistStaleMs: Number(config.hls.playlistStaleSeconds || 10) * 1000,
+  playlistStartupTimeoutMs: Number(config.hls.playlistStartupTimeoutSeconds || 20) * 1000
 });
 const recordingManager = new RecordingManager({
   ffmpegBin: process.env.OTTS_FFMPEG_BIN || "ffmpeg",
@@ -1125,8 +1128,19 @@ app.post("/api/streams/hls/start", async (req, res) => {
     return;
   }
 
-  const status = await hlsManager.ensureRunning(String(streamKey));
-  const ready = await hlsManager.waitForPlaylist(String(streamKey), 8000);
+  const upstream = await getUpstreamStreams();
+  const stream = (upstream.streams || []).find((item) => item.stream_key === String(streamKey));
+  if (!stream?.has_publisher) {
+    res.status(404).json({ ok: false, error: "stream is not publishing", hls: hlsManager.getStatus(String(streamKey)) });
+    return;
+  }
+
+  const status = await hlsManager.ensureRunning(String(streamKey), stream);
+  if (status.start_blocked) {
+    res.status(409).json({ ok: false, error: status.last_error || "HLS start blocked", hls: status });
+    return;
+  }
+  const ready = await hlsManager.waitForPlaylist(String(streamKey), hlsManager.playlistStartupTimeoutMs);
   await emitCallback("on_hls", {
     stream_key: String(streamKey),
     data: { action: "start", ready, hls: hlsManager.getStatus(String(streamKey)) }
