@@ -58,6 +58,16 @@ async function walkFiles(rootDir) {
   return result;
 }
 
+function isStreamReadyForRecording(stream) {
+  if (!stream || !stream.stream_key || !stream.has_publisher) {
+    return false;
+  }
+  if (stream.ready_for_play === false) {
+    return false;
+  }
+  return Boolean(stream.has_video_sequence_header || stream.video_codec === "h264");
+}
+
 export class RecordingManager {
   constructor(options = {}) {
     this.ffmpegBin = options.ffmpegBin || "ffmpeg";
@@ -104,6 +114,15 @@ export class RecordingManager {
 
   getStatus(streamKey) {
     const proc = this.processes.get(streamKey);
+    let bytes = 0;
+    if (proc?.outputPath) {
+      try {
+        bytes = fs.statSync(proc.outputPath).size;
+      } catch {
+        bytes = 0;
+      }
+    }
+    const finalized = Boolean(proc && proc.exited && bytes > 0 && !proc.lastError);
     return {
       stream_key: streamKey,
       recording: Boolean(proc && !proc.exited),
@@ -118,7 +137,9 @@ export class RecordingManager {
       stopped_epoch_ms: proc?.stoppedEpochMs || null,
       last_exit_code: proc?.lastExitCode ?? null,
       last_error: proc?.lastError || null,
-      bytes: proc?.outputPath && fs.existsSync(proc.outputPath) ? fs.statSync(proc.outputPath).size : 0,
+      bytes,
+      finalized,
+      download_ready: proc?.format === "mp4" ? finalized : bytes > 0,
       log_path: proc?.logPath || null
     };
   }
@@ -138,6 +159,9 @@ export class RecordingManager {
     const existing = this.processes.get(normalizedKey);
     if (existing && !existing.exited) {
       return this.getStatus(normalizedKey);
+    }
+    if (options.streamState && !isStreamReadyForRecording(options.streamState)) {
+      throw new Error("stream not ready for recording");
     }
 
     await this.ensureRoot();
@@ -181,6 +205,7 @@ export class RecordingManager {
       stoppedEpochMs: null,
       lastExitCode: null,
       lastError: null,
+      stopRequested: false,
       logStream
     };
 
@@ -194,7 +219,11 @@ export class RecordingManager {
       state.stoppedEpochMs = Date.now();
       state.stoppedAt = new Date(state.stoppedEpochMs).toISOString();
       state.lastExitCode = code;
-      if (signal) {
+      const gracefulStopExit = state.stopRequested && (code === 0 || code === 255 || signal === "SIGINT" || signal === "SIGTERM");
+      if (code && code !== 0 && !gracefulStopExit) {
+        state.lastError = `exit:${code}`;
+      }
+      if (signal && !gracefulStopExit) {
         state.lastError = `signal:${signal}`;
       }
       logStream.end();
@@ -225,6 +254,31 @@ export class RecordingManager {
     });
   }
 
+  async waitForStableFile(filePath, timeoutMs = 3000) {
+    const deadline = Date.now() + timeoutMs;
+    let previousSize = -1;
+    let stableCount = 0;
+    while (Date.now() < deadline) {
+      let size = 0;
+      try {
+        size = (await fsp.stat(filePath)).size;
+      } catch {
+        size = 0;
+      }
+      if (size > 0 && size === previousSize) {
+        stableCount += 1;
+        if (stableCount >= 2) {
+          return true;
+        }
+      } else {
+        stableCount = 0;
+      }
+      previousSize = size;
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    return false;
+  }
+
   async stop(streamKey) {
     const normalizedKey = String(streamKey || "").trim();
     const proc = this.processes.get(normalizedKey);
@@ -232,11 +286,19 @@ export class RecordingManager {
       return null;
     }
     if (!proc.exited) {
+      proc.stopRequested = true;
       proc.child.kill("SIGINT");
       await this.waitForExit(proc.child);
       if (!proc.exited) {
         proc.child.kill("SIGTERM");
         await this.waitForExit(proc.child, 2000);
+      }
+      if (!proc.exited) {
+        proc.child.kill("SIGKILL");
+        await this.waitForExit(proc.child, 1000);
+      }
+      if (proc.outputPath) {
+        await this.waitForStableFile(proc.outputPath);
       }
     }
     return this.getStatus(normalizedKey);
@@ -261,6 +323,8 @@ export class RecordingManager {
           path: filePath,
           public_path: `/recordings/${relative.split(path.sep).map(encodeURIComponent).join("/")}`,
           bytes: stat.size,
+          finalized: stat.size > 0,
+          download_ready: stat.size > 0,
           created_at: stat.birthtime.toISOString(),
           modified_at: stat.mtime.toISOString(),
           modified_epoch_ms: stat.mtimeMs

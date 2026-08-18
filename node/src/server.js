@@ -302,7 +302,8 @@ async function maybeAutoRecord(streamKey, stream) {
   }
   try {
     const status = await recordingManager.start(streamKey, {
-      format: recordingPolicy.defaultFormat || "flv"
+      format: recordingPolicy.defaultFormat || "flv",
+      streamState: stream
     });
     await emitCallback("on_dvr", {
       stream_key: streamKey,
@@ -742,7 +743,13 @@ app.post("/api/recordings/start", async (req, res) => {
     return;
   }
   try {
-    const status = await recordingManager.start(streamKey, { format });
+    const upstream = await getUpstreamStreams();
+    const stream = (upstream.streams || []).find((item) => item.stream_key === streamKey);
+    if (!stream?.has_publisher) {
+      res.status(404).json({ ok: false, error: "stream is not publishing", recording: recordingManager.getStatus(streamKey) });
+      return;
+    }
+    const status = await recordingManager.start(streamKey, { format, streamState: stream });
     await emitCallback("on_dvr", {
       stream_key: streamKey,
       data: { action: "start", format, recording: status }
