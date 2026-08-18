@@ -12,6 +12,9 @@
 #include <chrono>
 #include <csignal>
 #include <filesystem>
+#include <fstream>
+#include <optional>
+#include <regex>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -94,6 +97,17 @@ std::string env_string(const char* name, std::string fallback = {}) {
     return value == nullptr || std::string(value).empty() ? std::move(fallback) : std::string(value);
 }
 
+void set_env_if_unset(const std::string& name, const std::string& value) {
+    if (value.empty() || std::getenv(name.c_str()) != nullptr) {
+        return;
+    }
+#ifdef _WIN32
+    _putenv_s(name.c_str(), value.c_str());
+#else
+    setenv(name.c_str(), value.c_str(), 0);
+#endif
+}
+
 std::uint16_t env_port(const char* name, std::uint16_t fallback) {
     const auto value = env_string(name);
     if (value.empty()) {
@@ -107,6 +121,128 @@ std::uint16_t env_port(const char* name, std::uint16_t fallback) {
     } catch (...) {
     }
     return fallback;
+}
+
+struct RuntimeConfig {
+    std::filesystem::path path;
+    bool loaded{false};
+    std::string error;
+    std::string server;
+    std::string ports;
+    std::string auth;
+    std::string recording;
+    std::string hls;
+    std::string logging;
+    std::string webrtc;
+};
+
+std::optional<std::string> read_text_file(const std::filesystem::path& path) {
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        return std::nullopt;
+    }
+    std::ostringstream body;
+    body << file.rdbuf();
+    return body.str();
+}
+
+std::optional<std::string> json_object_body(const std::string& json, const std::string& key) {
+    const auto key_pos = json.find("\"" + key + "\"");
+    if (key_pos == std::string::npos) {
+        return std::nullopt;
+    }
+    const auto open = json.find('{', key_pos);
+    if (open == std::string::npos) {
+        return std::nullopt;
+    }
+    int depth = 0;
+    bool in_string = false;
+    bool escaped = false;
+    for (std::size_t i = open; i < json.size(); ++i) {
+        const auto ch = json[i];
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+            } else if (ch == '\\') {
+                escaped = true;
+            } else if (ch == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+        if (ch == '"') {
+            in_string = true;
+            continue;
+        }
+        if (ch == '{') {
+            ++depth;
+        } else if (ch == '}') {
+            --depth;
+            if (depth == 0) {
+                return json.substr(open + 1, i - open - 1);
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<std::string> json_string_value(const std::string& object, const std::string& key) {
+    const std::regex pattern("\"" + key + "\"\\s*:\\s*\"([^\"]*)\"");
+    std::smatch match;
+    if (std::regex_search(object, match, pattern) && match.size() > 1) {
+        return match[1].str();
+    }
+    return std::nullopt;
+}
+
+std::optional<std::uint64_t> json_u64_value(const std::string& object, const std::string& key) {
+    const std::regex pattern("\"" + key + "\"\\s*:\\s*([0-9]+)");
+    std::smatch match;
+    if (std::regex_search(object, match, pattern) && match.size() > 1) {
+        try {
+            return static_cast<std::uint64_t>(std::stoull(match[1].str()));
+        } catch (...) {
+            return std::nullopt;
+        }
+    }
+    return std::nullopt;
+}
+
+RuntimeConfig load_runtime_config(const std::filesystem::path& project_root) {
+    RuntimeConfig config;
+    config.path = env_string("OTTS_CONFIG_JSON", (project_root / "config" / "otts.config.json").string());
+    const auto content = read_text_file(config.path);
+    if (!content.has_value()) {
+        config.error = "config file not found";
+        return config;
+    }
+    config.loaded = true;
+    config.server = json_object_body(*content, "server").value_or("");
+    config.ports = json_object_body(*content, "ports").value_or("");
+    config.auth = json_object_body(*content, "auth").value_or("");
+    config.recording = json_object_body(*content, "recording").value_or("");
+    config.hls = json_object_body(*content, "hls").value_or("");
+    config.logging = json_object_body(*content, "logging").value_or("");
+    const auto protocols = json_object_body(*content, "protocols").value_or("");
+    config.webrtc = json_object_body(protocols, "webrtc").value_or("");
+    return config;
+}
+
+std::uint16_t config_port(const RuntimeConfig& config, const std::string& key, std::uint16_t fallback) {
+    if (const auto value = json_u64_value(config.ports, key)) {
+        if (*value > 0 && *value <= 65535) {
+            return static_cast<std::uint16_t>(*value);
+        }
+    }
+    return fallback;
+}
+
+std::string config_string(const std::string& object, const std::string& key, const std::string& fallback = {}) {
+    return json_string_value(object, key).value_or(fallback);
+}
+
+std::uint64_t config_u64(const std::string& object, const std::string& key, std::uint64_t fallback) {
+    return json_u64_value(object, key).value_or(fallback);
 }
 
 std::uint64_t env_u64(const char* name, std::uint64_t fallback) {
@@ -176,16 +312,43 @@ int main() {
     std::signal(SIGTERM, handle_signal);
     std::signal(SIGPIPE, SIG_IGN);
 
-    const auto rtmp_port = env_port("OTTS_RTMP_PORT", 1935);
-    const auto http_api_port = env_port("OTTS_HTTP_API_PORT", 8080);
-    const auto compat_http_port = env_port("OTTS_COMPAT_HTTP_PORT", 1985);
-    const auto node_http_port = env_port("PORT", 3000);
-    const auto node_https_port = env_port("HTTPS_PORT", 3443);
-    const auto webrtc_gateway_port = env_port("OTTS_WEBRTC_GATEWAY_PORT", 8081);
-    const auto cpp_rtsp_publish_port = env_port("OTTS_CPP_RTSP_PUBLISH_PORT", env_port("OTTS_RTSP_PUBLISH_PORT", 0));
-    const auto cpp_rtsp_play_port = env_port("OTTS_CPP_RTSP_PLAY_PORT", 0);
-    const auto cpp_srt_publish_port = env_port("OTTS_CPP_SRT_PUBLISH_PORT", env_port("OTTS_SRT_PUBLISH_PORT_BASE", 0));
-    const auto cpp_srt_play_port = env_port("OTTS_CPP_SRT_PLAY_PORT", env_port("OTTS_SRT_PLAY_PORT_BASE", 0));
+    const auto project_root = detect_project_root();
+    const auto runtime_config = load_runtime_config(project_root);
+    set_env_if_unset("OTTS_CONFIG_JSON", runtime_config.path.string());
+    set_env_if_unset("OTTS_PUBLIC_HOST", config_string(runtime_config.server, "publicHost", "192.168.40.11"));
+    set_env_if_unset("OTTS_RTSP_PUBLIC_HOST", config_string(runtime_config.server, "rtspPublicHost", env_string("OTTS_PUBLIC_HOST", "192.168.40.11")));
+    set_env_if_unset("OTTS_SRT_PUBLIC_HOST", config_string(runtime_config.server, "srtPublicHost", env_string("OTTS_PUBLIC_HOST", "192.168.40.11")));
+    set_env_if_unset("OTTS_STREAM_TOKEN", config_string(runtime_config.auth, "token"));
+    set_env_if_unset("OTTS_AUTH_SECRET", config_string(runtime_config.auth, "secret"));
+    set_env_if_unset("OTTS_AUTH_TTL_SECONDS", std::to_string(config_u64(runtime_config.auth, "ttlSeconds", 3600)));
+    set_env_if_unset("OTTS_RECORDING_ROOT", config_string(runtime_config.recording, "rootDir", "/tmp/otts_recordings"));
+    set_env_if_unset("OTTS_HLS_ROOT", config_string(runtime_config.hls, "rootDir", "/tmp/otts_hls"));
+    set_env_if_unset("OTTS_LOG_LEVEL", config_string(runtime_config.logging, "level", "info"));
+    set_env_if_unset("OTTS_WEBRTC_MODE", config_string(runtime_config.webrtc, "mode", "auto"));
+
+    const auto rtmp_port = env_port("OTTS_RTMP_PORT", config_port(runtime_config, "rtmp", 1935));
+    const auto http_api_port = env_port("OTTS_HTTP_API_PORT", config_port(runtime_config, "httpApi", 8080));
+    const auto compat_http_port = env_port("OTTS_COMPAT_HTTP_PORT", config_port(runtime_config, "compatHttp", 1985));
+    const auto node_http_port = env_port("PORT", config_port(runtime_config, "nodeHttp", 3000));
+    const auto node_https_port = env_port("HTTPS_PORT", config_port(runtime_config, "nodeHttps", 3443));
+    const auto webrtc_gateway_port = env_port("OTTS_WEBRTC_GATEWAY_PORT", config_port(runtime_config, "webrtcGateway", 8081));
+    const auto cpp_rtsp_publish_port =
+        env_port("OTTS_CPP_RTSP_PUBLISH_PORT", env_port("OTTS_RTSP_PUBLISH_PORT", config_port(runtime_config, "rtspPublish", 0)));
+    const auto cpp_rtsp_play_port = env_port("OTTS_CPP_RTSP_PLAY_PORT", config_port(runtime_config, "rtspPlay", 0));
+    const auto cpp_srt_publish_port =
+        env_port("OTTS_CPP_SRT_PUBLISH_PORT", env_port("OTTS_SRT_PUBLISH_PORT_BASE", config_port(runtime_config, "srtPublish", 0)));
+    const auto cpp_srt_play_port =
+        env_port("OTTS_CPP_SRT_PLAY_PORT", env_port("OTTS_SRT_PLAY_PORT_BASE", config_port(runtime_config, "srtPlay", 0)));
+    set_env_if_unset("OTTS_RTMP_PORT", std::to_string(rtmp_port));
+    set_env_if_unset("OTTS_HTTP_API_PORT", std::to_string(http_api_port));
+    set_env_if_unset("OTTS_COMPAT_HTTP_PORT", std::to_string(compat_http_port));
+    set_env_if_unset("PORT", std::to_string(node_http_port));
+    set_env_if_unset("HTTPS_PORT", std::to_string(node_https_port));
+    set_env_if_unset("OTTS_WEBRTC_GATEWAY_PORT", std::to_string(webrtc_gateway_port));
+    set_env_if_unset("OTTS_RTSP_PUBLISH_PORT", std::to_string(cpp_rtsp_publish_port));
+    set_env_if_unset("OTTS_RTSP_PLAY_PORT", std::to_string(cpp_rtsp_play_port));
+    set_env_if_unset("OTTS_SRT_PUBLISH_PORT_BASE", std::to_string(cpp_srt_publish_port));
+    set_env_if_unset("OTTS_SRT_PLAY_PORT_BASE", std::to_string(cpp_srt_play_port));
     const auto cpp_srt_stream_key = env_string("OTTS_CPP_SRT_STREAM_KEY", "live/srt-demo");
     const auto cleanup_interval_ms = env_u64("OTTS_CLEANUP_INTERVAL_MS", 5000);
     const auto external_publisher_idle_ms = env_u64("OTTS_EXTERNAL_PUBLISHER_IDLE_MS", 30000);
@@ -215,7 +378,6 @@ int main() {
         return 1;
     }
 
-    const auto project_root = detect_project_root();
     const auto python_dir = (project_root / "python").string();
     const auto node_dir = (project_root / "node").string();
     const auto cert_key = (project_root / "node" / "certs" / "otts.key").string();
@@ -255,6 +417,7 @@ int main() {
                 "--enable-rtmp-bridge",
             },
             child_environment({
+                {"OTTS_CONFIG_JSON", runtime_config.path.string()},
                 {"OTTS_STREAM_TOKEN", stream_token},
                 {"OTTS_AUTH_SECRET", auth_secret},
                 {"OTTS_AUTH_TTL_SECONDS", auth_ttl},
@@ -271,6 +434,7 @@ int main() {
         node_dir,
         {"node", "src/server.js"},
         child_environment({
+            {"OTTS_CONFIG_JSON", runtime_config.path.string()},
             {"PORT", std::to_string(node_http_port)},
             {"HTTPS_PORT", std::to_string(node_https_port)},
             {"OTTS_API_BASE", "http://127.0.0.1:" + std::to_string(http_api_port)},
@@ -295,6 +459,8 @@ int main() {
             {"OTTS_NATIVE_PROTOCOL_ONLY", env_string("OTTS_NATIVE_PROTOCOL_ONLY", "true")},
             {"OTTS_FFMPEG_BIN", env_string("OTTS_FFMPEG_BIN", "ffmpeg")},
             {"OTTS_RECORDING_ROOT", env_string("OTTS_RECORDING_ROOT", "/tmp/otts_recordings")},
+            {"OTTS_HLS_ROOT", env_string("OTTS_HLS_ROOT", "/tmp/otts_hls")},
+            {"OTTS_LOG_LEVEL", env_string("OTTS_LOG_LEVEL", "info")},
         }),
         "/tmp/otts_node.out",
         "/tmp/otts_node.err");
@@ -315,6 +481,7 @@ int main() {
                                       external_publisher_idle_ms,
                                       stopped_session_retention_ms,
                                       should_start_webrtc_gateway,
+                                      runtime_config,
                                       &webrtc_service]() {
         const auto now_ms = now_epoch_ms();
         std::ostringstream body;
@@ -325,6 +492,11 @@ int main() {
         body << "\"started_at_epoch_ms\":" << started_at_epoch_ms << ",";
         body << "\"now_epoch_ms\":" << now_ms << ",";
         body << "\"uptime_ms\":" << (now_ms >= started_at_epoch_ms ? (now_ms - started_at_epoch_ms) : 0) << ",";
+        body << "\"config\":{"
+             << "\"path\":\"" << json_escape(runtime_config.path.string()) << "\","
+             << "\"loaded\":" << (runtime_config.loaded ? "true" : "false") << ","
+             << "\"error\":\"" << json_escape(runtime_config.error) << "\""
+             << "},";
         body << "\"ports\":{"
              << "\"rtmp\":" << rtmp_port << ","
              << "\"http_api\":" << http_api_port << ","
