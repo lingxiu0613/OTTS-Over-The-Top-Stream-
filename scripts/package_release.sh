@@ -45,6 +45,12 @@ if [[ -f config/otts.env.example ]]; then
   cp -a config/otts.env.example "${PACKAGE_DIR}/config/otts.env"
   cp -a config/otts.env.example "${PACKAGE_DIR}/config/otts.env.example"
 fi
+if [[ -f config/otts.config.json ]]; then
+  cp -a config/otts.config.json "${PACKAGE_DIR}/config/otts.config.json"
+fi
+if [[ -f config/otts.config.json.example ]]; then
+  cp -a config/otts.config.json.example "${PACKAGE_DIR}/config/otts.config.json.example"
+fi
 
 cat > "${PACKAGE_DIR}/install_deps_ubuntu.sh" <<'EOF'
 #!/usr/bin/env bash
