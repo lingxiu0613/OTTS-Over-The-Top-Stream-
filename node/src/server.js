@@ -4,6 +4,8 @@ import http from "http";
 import https from "https";
 import path from "path";
 import { fileURLToPath } from "url";
+import { CallbackManager } from "./callback_manager.js";
+import { ConfigManager } from "./config_manager.js";
 import { HlsManager } from "./hls_manager.js";
 import { RecordingManager } from "./recording_manager.js";
 import { RtspCompatManager } from "./rtsp_compat_manager.js";
@@ -14,22 +16,39 @@ import { SrtManager } from "./srt_manager.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const projectRoot = path.resolve(__dirname, "..", "..");
+const configManager = new ConfigManager({ projectRoot });
+await configManager.load().catch((error) => {
+  console.error(`OTTS config load failed, using defaults: ${error instanceof Error ? error.message : "unknown error"}`);
+});
+configManager.startWatching();
+const config = configManager.getConfig();
+const callbackManager = new CallbackManager({ configManager });
 
 const app = express();
-const port = process.env.PORT || 3000;
-const httpsPort = process.env.HTTPS_PORT || 3443;
+const port = process.env.PORT || config.ports.nodeHttp || 3000;
+const httpsPort = process.env.HTTPS_PORT || config.ports.nodeHttps || 3443;
 const apiBase = process.env.OTTS_API_BASE || "http://127.0.0.1:8080";
 const webrtcGatewayBase = process.env.OTTS_WEBRTC_GATEWAY_BASE || "http://127.0.0.1:8081";
 const tlsKeyPath = process.env.OTTS_TLS_KEY_PATH || "";
 const tlsCertPath = process.env.OTTS_TLS_CERT_PATH || "";
 const hlsManager = new HlsManager({
   ffmpegBin: process.env.OTTS_FFMPEG_BIN || "ffmpeg",
-  rtmpBase: process.env.OTTS_RTMP_BASE || "rtmp://127.0.0.1:1935"
+  rtmpBase: process.env.OTTS_RTMP_BASE || "rtmp://127.0.0.1:1935",
+  rootDir: config.hls.rootDir,
+  autoStart: config.hls.autoStart,
+  segmentSeconds: config.hls.segmentSeconds,
+  listSize: config.hls.listSize,
+  idleStopMs: Number(config.hls.idleStopSeconds || 15) * 1000,
+  cleanupAgeMs: Number(config.hls.cleanupAgeSeconds || 600) * 1000
 });
 const recordingManager = new RecordingManager({
   ffmpegBin: process.env.OTTS_FFMPEG_BIN || "ffmpeg",
   rtmpBase: process.env.OTTS_RTMP_BASE || "rtmp://127.0.0.1:1935",
-  rootDir: process.env.OTTS_RECORDING_ROOT || undefined
+  rootDir: config.recording.rootDir,
+  defaultFormat: config.recording.defaultFormat,
+  enabled: config.recording.enabled,
+  autoRecord: config.recording.autoRecord
 });
 const rtspProxyManager = new RtspProxyManager({
   ffmpegBin: process.env.OTTS_FFMPEG_BIN || "ffmpeg",
@@ -78,6 +97,21 @@ const srtBootstrapStreamKey = process.env.OTTS_SRT_BOOTSTRAP_STREAM_KEY || "live
 const srtBootstrapPlayEnabled = (process.env.OTTS_SRT_BOOTSTRAP_PLAY_ENABLED || "true") !== "false";
 const rtspPlaybackEnabled = (process.env.OTTS_RTSP_PLAY_COMPAT_ENABLED || "true") !== "false";
 const nativeProtocolOnly = (process.env.OTTS_NATIVE_PROTOCOL_ONLY || "true") !== "false";
+
+function applyRuntimeConfig(snapshot = configManager.getSnapshot()) {
+  const next = snapshot.config || configManager.getConfig();
+  hlsManager.updateOptions(next.hls || {});
+  recordingManager.updateOptions(next.recording || {});
+  console.log(`OTTS config applied from ${next.metadata?.configPath || "defaults"} at ${snapshot.loaded_at || new Date().toISOString()}`);
+}
+
+configManager.on("reload", (snapshot) => {
+  applyRuntimeConfig(snapshot);
+});
+configManager.on("error", (message) => {
+  console.error(`OTTS config reload failed: ${message}`);
+});
+applyRuntimeConfig();
 
 function buildStreamSummary(streams = []) {
   const summary = {
@@ -232,6 +266,144 @@ async function getSystemStatus() {
     service: "otts-core",
     managed_processes: []
   });
+}
+
+const streamEventState = new Map();
+
+function viewerCount(stream = {}) {
+  return Number(
+    stream.total_viewer_count
+      ?? stream.viewer_count
+      ?? ((Number(stream.http_flv_viewer_count || 0)) + (Number(stream.webrtc_viewer_count || 0)))
+      ?? 0
+  );
+}
+
+async function emitCallback(eventName, payload) {
+  try {
+    await callbackManager.emit(eventName, payload);
+  } catch (error) {
+    console.error(`OTTS callback ${eventName} failed: ${error instanceof Error ? error.message : "unknown error"}`);
+  }
+}
+
+async function maybeAutoRecord(streamKey, stream) {
+  const resolved = configManager.resolveStream(streamKey);
+  const recordingPolicy = resolved.policy?.recording || {};
+  if (!recordingPolicy.enabled || !recordingPolicy.autoRecord) {
+    return;
+  }
+  const current = recordingManager.getStatus(streamKey);
+  if (current.running) {
+    return;
+  }
+  try {
+    const status = await recordingManager.start(streamKey, {
+      format: recordingPolicy.defaultFormat || "flv"
+    });
+    await emitCallback("on_dvr", {
+      stream_key: streamKey,
+      source_protocol: stream.source_protocol,
+      data: { action: "auto_start", recording: status }
+    });
+  } catch (error) {
+    await emitCallback("on_dvr", {
+      stream_key: streamKey,
+      source_protocol: stream.source_protocol,
+      data: { action: "auto_start_failed", error: error instanceof Error ? error.message : "unknown error" }
+    });
+  }
+}
+
+async function reconcileStreamEvents(streams = []) {
+  const liveKeys = new Set();
+
+  for (const stream of streams) {
+    if (!stream?.stream_key) {
+      continue;
+    }
+    const streamKey = stream.stream_key;
+    liveKeys.add(streamKey);
+    const previous = streamEventState.get(streamKey) || {
+      hasPublisher: false,
+      viewers: 0,
+      hlsReady: false
+    };
+    const hasPublisher = Boolean(stream.has_publisher);
+    const viewers = viewerCount(stream);
+    const hls = hlsManager.getStatus(streamKey);
+    const hlsReady = Boolean(hls.playlist_exists);
+
+    if (hasPublisher && !previous.hasPublisher) {
+      await emitCallback("on_publish", {
+        stream_key: streamKey,
+        source_protocol: stream.source_protocol,
+        data: { stream }
+      });
+      await maybeAutoRecord(streamKey, stream);
+    }
+
+    if (!hasPublisher && previous.hasPublisher) {
+      await emitCallback("on_unpublish", {
+        stream_key: streamKey,
+        source_protocol: stream.source_protocol,
+        data: { stream }
+      });
+    }
+
+    if (viewers > 0 && previous.viewers <= 0) {
+      await emitCallback("on_play", {
+        stream_key: streamKey,
+        source_protocol: stream.source_protocol,
+        data: { viewers, stream }
+      });
+    }
+
+    if (viewers <= 0 && previous.viewers > 0) {
+      await emitCallback("on_stop", {
+        stream_key: streamKey,
+        source_protocol: stream.source_protocol,
+        data: { viewers, stream }
+      });
+    }
+
+    if (hlsReady !== previous.hlsReady) {
+      await emitCallback("on_hls", {
+        stream_key: streamKey,
+        source_protocol: stream.source_protocol,
+        data: {
+          action: hlsReady ? "ready" : "stopped",
+          hls
+        }
+      });
+    }
+
+    streamEventState.set(streamKey, {
+      hasPublisher,
+      viewers,
+      hlsReady,
+      lastSeenAt: new Date().toISOString()
+    });
+  }
+
+  for (const [streamKey, previous] of streamEventState.entries()) {
+    if (liveKeys.has(streamKey)) {
+      continue;
+    }
+    if (previous.hasPublisher) {
+      await emitCallback("on_unpublish", {
+        stream_key: streamKey,
+        data: { reason: "stream_removed" }
+      });
+    }
+    if (previous.viewers > 0) {
+      await emitCallback("on_stop", {
+        stream_key: streamKey,
+        data: { reason: "stream_removed" }
+      });
+    }
+    streamEventState.delete(streamKey);
+  }
 }
 
 async function fetchGatewayJson(pathname, fallback) {
@@ -424,9 +596,12 @@ app.use((req, _res, next) => {
 });
 app.use(express.json());
 app.use(express.static(path.join(__dirname, "..", "web")));
-app.use("/recordings", express.static(recordingManager.rootDir));
+app.use("/recordings", (req, res, next) => {
+  express.static(recordingManager.rootDir)(req, res, next);
+});
 
-app.use("/hls", express.static(hlsManager.rootDir, {
+app.use("/hls", (req, res, next) => {
+  express.static(hlsManager.rootDir, {
   fallthrough: true,
   setHeaders(res, filePath) {
     if (filePath.endsWith(".m3u8")) {
@@ -437,7 +612,41 @@ app.use("/hls", express.static(hlsManager.rootDir, {
       res.setHeader("Cache-Control", "no-cache");
     }
   }
-}));
+  })(req, res, next);
+});
+
+app.get("/api/config", (_req, res) => {
+  res.json(configManager.getSnapshot());
+});
+
+app.post("/api/config/reload", async (_req, res) => {
+  try {
+    const loaded = await configManager.load();
+    res.json({ ok: true, loaded_at: configManager.loadedAt, config: loaded });
+  } catch (error) {
+    res.status(400).json({
+      ok: false,
+      error: error instanceof Error ? error.message : "failed to reload config"
+    });
+  }
+});
+
+app.get("/api/config/stream", (req, res) => {
+  const streamKey = String(req.query.stream_key || "");
+  if (!streamKey) {
+    res.status(400).json({ ok: false, error: "missing stream_key" });
+    return;
+  }
+  res.json({ ok: true, stream: configManager.resolveStream(streamKey) });
+});
+
+app.get("/api/callbacks/events", (req, res) => {
+  res.json({ ok: true, events: callbackManager.listEvents(req.query.limit) });
+});
+
+app.get("/api/callbacks/config", (_req, res) => {
+  res.json({ ok: true, callbacks: configManager.getConfig().callbacks });
+});
 
 app.get("/api/health", async (_req, res) => {
   const health = await fetchJson("/api/health", {
@@ -449,6 +658,7 @@ app.get("/api/health", async (_req, res) => {
   const systemStatus = await getSystemStatus();
   const streams = await getUpstreamStreams();
   await hlsManager.syncStreams(streams.streams || []);
+  await reconcileStreamEvents(streams.streams || []);
   const streamList = streams.streams || [];
   const streamSummary = buildStreamSummary(streamList);
   const totalViewers = streamList.reduce(
@@ -493,6 +703,7 @@ app.get("/api/health", async (_req, res) => {
 app.get("/api/streams", async (_req, res) => {
   const state = await getUpstreamStreams();
   await hlsManager.syncStreams(state.streams || []);
+  await reconcileStreamEvents(state.streams || []);
   const enriched = (state.streams || []).map((stream) => ({
     ...stream,
     hls: hlsManager.getStatus(stream.stream_key),
@@ -529,6 +740,10 @@ app.post("/api/recordings/start", async (req, res) => {
   }
   try {
     const status = await recordingManager.start(streamKey, { format });
+    await emitCallback("on_dvr", {
+      stream_key: streamKey,
+      data: { action: "start", format, recording: status }
+    });
     res.json({ ok: true, recording: status });
   } catch (error) {
     res.status(400).json({
@@ -545,6 +760,10 @@ app.post("/api/recordings/stop", async (req, res) => {
     return;
   }
   const status = await recordingManager.stop(streamKey);
+  await emitCallback("on_dvr", {
+    stream_key: streamKey,
+    data: { action: "stop", recording: status }
+  });
   res.json({ ok: Boolean(status), recording: status });
 });
 
@@ -908,6 +1127,10 @@ app.post("/api/streams/hls/start", async (req, res) => {
 
   const status = await hlsManager.ensureRunning(String(streamKey));
   const ready = await hlsManager.waitForPlaylist(String(streamKey), 8000);
+  await emitCallback("on_hls", {
+    stream_key: String(streamKey),
+    data: { action: "start", ready, hls: hlsManager.getStatus(String(streamKey)) }
+  });
   res.json({ ok: ready, hls: hlsManager.getStatus(String(streamKey)) });
 });
 
@@ -919,11 +1142,19 @@ app.post("/api/streams/hls/stop", async (req, res) => {
   }
 
   const stopped = await hlsManager.stop(String(streamKey));
+  await emitCallback("on_hls", {
+    stream_key: String(streamKey),
+    data: { action: "stop", hls: hlsManager.getStatus(String(streamKey)) }
+  });
   res.json({ ok: stopped, hls: hlsManager.getStatus(String(streamKey)) });
 });
 
 app.post("/api/streams/hls/cleanup", async (_req, res) => {
   const removed = await hlsManager.cleanupStaleOutputsWithReport(false);
+  await emitCallback("on_hls", {
+    stream_key: "",
+    data: { action: "cleanup", removed }
+  });
   res.json({ ok: true, removed });
 });
 
@@ -980,6 +1211,7 @@ if (tlsKeyPath && tlsCertPath) {
 setInterval(async () => {
   const state = await getUpstreamStreams();
   await hlsManager.syncStreams(state.streams || []);
+  await reconcileStreamEvents(state.streams || []);
 }, 5000);
 
 if (!nativeProtocolOnly && srtBootstrapEnabled && srtBootstrapStreamKey) {

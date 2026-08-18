@@ -41,6 +41,12 @@ Current design principle:
 - `scripts/`: operational scripts for restart, status, stop, smoke tests
 - `docs/`: notes and staged design documents
 
+## Production Configuration
+
+Runtime production config lives in `config/otts.config.json`; start from `config/otts.config.json.example`.
+It covers vhost/app/stream policy, protocol ports, auth, recording, HLS, logging, and HTTP callback hooks.
+See `docs/config-and-callbacks.md` for hot reload rules and callback payloads.
+
 ## Stable Features In This Version
 
 - RTMP ingest from OBS / FFmpeg

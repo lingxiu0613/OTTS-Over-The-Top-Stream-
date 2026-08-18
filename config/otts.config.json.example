@@ -1,0 +1,113 @@
+{
+  "version": 1,
+  "server": {
+    "publicHost": "192.168.40.11",
+    "rtspPublicHost": "192.168.40.11",
+    "srtPublicHost": "192.168.40.11"
+  },
+  "ports": {
+    "rtmp": 1935,
+    "httpApi": 8080,
+    "compatHttp": 1985,
+    "nodeHttp": 3000,
+    "nodeHttps": 3443,
+    "webrtcGateway": 8081,
+    "rtspPublish": 8554,
+    "rtspPlay": 8556,
+    "srtPublish": 9000,
+    "srtPlay": 10000
+  },
+  "protocols": {
+    "rtmp": { "enabled": true },
+    "flv": { "enabled": true },
+    "hls": { "enabled": true },
+    "rtsp": {
+      "enabled": true,
+      "publishMode": "core-direct-flv",
+      "playMode": "core-egress-flv"
+    },
+    "srt": {
+      "enabled": true,
+      "publishMode": "core-direct-flv",
+      "playMode": "core-egress-flv"
+    },
+    "webrtc": {
+      "enabled": true,
+      "mode": "native"
+    }
+  },
+  "auth": {
+    "enabled": false,
+    "token": "",
+    "secret": "",
+    "ttlSeconds": 3600
+  },
+  "recording": {
+    "enabled": true,
+    "rootDir": "/tmp/otts_recordings",
+    "defaultFormat": "flv",
+    "autoRecord": false
+  },
+  "hls": {
+    "rootDir": "/tmp/otts_hls",
+    "autoStart": true,
+    "segmentSeconds": 2,
+    "listSize": 6,
+    "idleStopSeconds": 15,
+    "cleanupAgeSeconds": 600
+  },
+  "logging": {
+    "level": "info",
+    "runtimeLog": "/tmp/otts_runtime.log"
+  },
+  "callbacks": {
+    "enabled": false,
+    "timeoutMs": 3000,
+    "retries": 1,
+    "events": {
+      "on_publish": [],
+      "on_unpublish": [],
+      "on_play": [],
+      "on_stop": [],
+      "on_dvr": [],
+      "on_hls": []
+    }
+  },
+  "vhosts": [
+    {
+      "name": "__default__",
+      "enabled": true,
+      "defaults": {
+        "auth": {
+          "enabled": false
+        }
+      },
+      "apps": [
+        {
+          "name": "live",
+          "enabled": true,
+          "defaults": {
+            "hls": {
+              "autoStart": true
+            },
+            "recording": {
+              "autoRecord": false
+            }
+          },
+          "streams": [
+            {
+              "name": "nolo001",
+              "enabled": true,
+              "defaults": {
+                "recording": {
+                  "autoRecord": false,
+                  "defaultFormat": "flv"
+                }
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

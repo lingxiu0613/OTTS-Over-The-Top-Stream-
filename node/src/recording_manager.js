@@ -63,7 +63,25 @@ export class RecordingManager {
     this.ffmpegBin = options.ffmpegBin || "ffmpeg";
     this.rtmpBase = options.rtmpBase || "rtmp://127.0.0.1:1935";
     this.rootDir = options.rootDir || path.join(os.tmpdir(), "otts_recordings");
+    this.defaultFormat = this.normalizeFormat(options.defaultFormat || "flv");
+    this.enabled = options.enabled ?? true;
+    this.autoRecord = options.autoRecord ?? false;
     this.processes = new Map();
+  }
+
+  updateOptions(options = {}) {
+    if (options.rootDir) {
+      this.rootDir = options.rootDir;
+    }
+    if (options.defaultFormat) {
+      this.defaultFormat = this.normalizeFormat(options.defaultFormat);
+    }
+    if (options.enabled !== undefined) {
+      this.enabled = Boolean(options.enabled);
+    }
+    if (options.autoRecord !== undefined) {
+      this.autoRecord = Boolean(options.autoRecord);
+    }
   }
 
   async ensureRoot() {
@@ -110,6 +128,9 @@ export class RecordingManager {
   }
 
   async start(streamKey, options = {}) {
+    if (!this.enabled) {
+      throw new Error("recording disabled by config");
+    }
     const normalizedKey = String(streamKey || "").trim();
     if (!normalizedKey) {
       throw new Error("missing stream_key");
@@ -120,7 +141,7 @@ export class RecordingManager {
     }
 
     await this.ensureRoot();
-    const format = this.normalizeFormat(options.format);
+    const format = this.normalizeFormat(options.format || this.defaultFormat);
     const startedEpochMs = Date.now();
     const outputDir = this.outputDir(normalizedKey);
     await fsp.mkdir(outputDir, { recursive: true });

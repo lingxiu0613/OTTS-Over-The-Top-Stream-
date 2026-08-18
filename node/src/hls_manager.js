@@ -71,9 +71,32 @@ export class HlsManager {
     this.rtmpBase = options.rtmpBase || "rtmp://127.0.0.1:1935";
     this.rootDir = options.rootDir || path.join(os.tmpdir(), "otts_hls");
     this.autoStart = options.autoStart ?? true;
+    this.segmentSeconds = options.segmentSeconds || 2;
+    this.listSize = options.listSize || 6;
     this.idleStopMs = options.idleStopMs || 15000;
     this.cleanupAgeMs = options.cleanupAgeMs || 10 * 60 * 1000;
     this.processes = new Map();
+  }
+
+  updateOptions(options = {}) {
+    if (options.rootDir) {
+      this.rootDir = options.rootDir;
+    }
+    if (options.autoStart !== undefined) {
+      this.autoStart = Boolean(options.autoStart);
+    }
+    if (options.segmentSeconds) {
+      this.segmentSeconds = Number(options.segmentSeconds) || this.segmentSeconds;
+    }
+    if (options.listSize) {
+      this.listSize = Number(options.listSize) || this.listSize;
+    }
+    if (options.idleStopSeconds) {
+      this.idleStopMs = Number(options.idleStopSeconds) * 1000;
+    }
+    if (options.cleanupAgeSeconds) {
+      this.cleanupAgeMs = Number(options.cleanupAgeSeconds) * 1000;
+    }
   }
 
   async ensureRoot() {
@@ -189,9 +212,9 @@ export class HlsManager {
         "-f",
         "hls",
         "-hls_time",
-        "2",
+        String(this.segmentSeconds),
         "-hls_list_size",
-        "6",
+        String(this.listSize),
         "-hls_flags",
         "delete_segments+append_list+omit_endlist+program_date_time",
         "-hls_segment_filename",

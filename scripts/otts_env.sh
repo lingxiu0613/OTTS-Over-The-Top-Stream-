@@ -5,6 +5,7 @@ set -euo pipefail
 
 OTTS_ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OTTS_CONFIG_FILE="${OTTS_CONFIG_FILE:-${OTTS_ROOT_DIR}/config/otts.env}"
+OTTS_CONFIG_JSON="${OTTS_CONFIG_JSON:-${OTTS_ROOT_DIR}/config/otts.config.json}"
 
 otts_trim() {
   local value="$1"
@@ -64,6 +65,7 @@ otts_load_env() {
   export OTTS_AUTH_TTL_SECONDS="${OTTS_AUTH_TTL_SECONDS:-3600}"
   export OTTS_FFMPEG_BIN="${OTTS_FFMPEG_BIN:-ffmpeg}"
   export OTTS_RECORDING_ROOT="${OTTS_RECORDING_ROOT:-/tmp/otts_recordings}"
+  export OTTS_CONFIG_JSON="${OTTS_CONFIG_JSON}"
 }
 
 otts_tcp_ports() {

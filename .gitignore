@@ -24,3 +24,6 @@ tmp_remote_*
 tmp_ssh_askpass.bat
 
 /tmp/
+
+# Local production runtime config
+config/otts.config.json
