@@ -104,6 +104,22 @@ bool send_all(int socket_fd, std::string_view data) {
     return true;
 }
 
+std::string metric_label_escape(const std::string& value) {
+    std::string escaped;
+    escaped.reserve(value.size() + 8);
+    for (const auto ch : value) {
+        if (ch == '\\' || ch == '"') {
+            escaped.push_back('\\');
+            escaped.push_back(ch);
+        } else if (ch == '\n' || ch == '\r') {
+            escaped += "\\n";
+        } else {
+            escaped.push_back(ch);
+        }
+    }
+    return escaped;
+}
+
 bool has_expect_100_continue(const std::string& request) {
     const auto header_end = request.find("\r\n\r\n");
     const auto header_text = request.substr(0, header_end == std::string::npos ? request.size() : header_end);
@@ -435,6 +451,10 @@ std::string HttpServer::handle_request(const std::string& request) {
 
     if (method == "GET" && path == "/api/maintenance") {
         return make_json_response(build_maintenance_json());
+    }
+
+    if (method == "GET" && path == "/metrics") {
+        return make_text_response(build_metrics_text(), "200 OK");
     }
 
     if (method == "POST" && path.rfind("/api/maintenance/cleanup", 0) == 0) {
@@ -971,6 +991,80 @@ std::string HttpServer::build_maintenance_json() const {
     body << "\"last_run_epoch_ms\":" << stats.last_run_epoch_ms;
     body << "}";
     body << "}";
+    return body.str();
+}
+
+std::string HttpServer::build_metrics_text() const {
+    const auto streams = registry_.snapshots();
+    const auto sessions = registry_.external_sessions();
+    const auto cleanup = registry_.cleanup_stats();
+    const auto webrtc_sessions = webrtc_service_.snapshots();
+
+    std::uint64_t publishers = 0;
+    std::uint64_t viewers = 0;
+    std::uint64_t total_packets = 0;
+    std::uint64_t total_bytes = 0;
+    for (const auto& stream : streams) {
+        publishers += stream.has_publisher ? 1 : 0;
+        viewers += stream.viewer_count + stream.callback_viewer_count + stream.external_viewer_count;
+        total_packets += stream.total_packets;
+        total_bytes += stream.total_bytes;
+    }
+
+    std::ostringstream body;
+    body << "# HELP otts_streams_total Current number of stream objects.\n";
+    body << "# TYPE otts_streams_total gauge\n";
+    body << "otts_streams_total " << streams.size() << "\n";
+    body << "# HELP otts_publishers_online Current number of online publishers.\n";
+    body << "# TYPE otts_publishers_online gauge\n";
+    body << "otts_publishers_online " << publishers << "\n";
+    body << "# HELP otts_viewers_total Current number of viewers across RTMP, FLV, WebRTC, and external sessions.\n";
+    body << "# TYPE otts_viewers_total gauge\n";
+    body << "otts_viewers_total " << viewers << "\n";
+    body << "# HELP otts_media_packets_total Media packets observed by the stream registry.\n";
+    body << "# TYPE otts_media_packets_total counter\n";
+    body << "otts_media_packets_total " << total_packets << "\n";
+    body << "# HELP otts_media_bytes_total Media payload bytes observed by the stream registry.\n";
+    body << "# TYPE otts_media_bytes_total counter\n";
+    body << "otts_media_bytes_total " << total_bytes << "\n";
+
+    body << "# HELP otts_stream_ready Stream readiness by stream key.\n";
+    body << "# TYPE otts_stream_ready gauge\n";
+    body << "# HELP otts_stream_viewers Viewers by stream key.\n";
+    body << "# TYPE otts_stream_viewers gauge\n";
+    body << "# HELP otts_stream_bitrate_kbps Average stream bitrate in kbps.\n";
+    body << "# TYPE otts_stream_bitrate_kbps gauge\n";
+    body << "# HELP otts_stream_last_media_age_ms Age of the latest media packet.\n";
+    body << "# TYPE otts_stream_last_media_age_ms gauge\n";
+    for (const auto& stream : streams) {
+        const auto key = metric_label_escape(stream.stream_key);
+        const auto source = metric_label_escape(stream.source_protocol);
+        const auto total_viewers = stream.viewer_count + stream.callback_viewer_count + stream.external_viewer_count;
+        body << "otts_stream_ready{stream_key=\"" << key << "\",source=\"" << source << "\"} "
+             << (stream.ready_for_play ? 1 : 0) << "\n";
+        body << "otts_stream_viewers{stream_key=\"" << key << "\",source=\"" << source << "\"} "
+             << total_viewers << "\n";
+        body << "otts_stream_bitrate_kbps{stream_key=\"" << key << "\",source=\"" << source << "\"} "
+             << std::fixed << std::setprecision(2) << stream.average_bitrate_kbps << "\n";
+        body << "otts_stream_last_media_age_ms{stream_key=\"" << key << "\",source=\"" << source << "\"} "
+             << stream.last_media_age_ms << "\n";
+    }
+
+    body << "# HELP otts_protocol_sessions Current external/native protocol sessions.\n";
+    body << "# TYPE otts_protocol_sessions gauge\n";
+    body << "otts_protocol_sessions " << sessions.size() << "\n";
+    body << "# HELP otts_webrtc_sessions Current WebRTC sessions.\n";
+    body << "# TYPE otts_webrtc_sessions gauge\n";
+    body << "otts_webrtc_sessions " << webrtc_sessions.size() << "\n";
+    body << "# HELP otts_cleanup_runs_total Cleanup loop runs.\n";
+    body << "# TYPE otts_cleanup_runs_total counter\n";
+    body << "otts_cleanup_runs_total " << cleanup.runs << "\n";
+    body << "# HELP otts_cleanup_removed_streams_total Streams removed by cleanup.\n";
+    body << "# TYPE otts_cleanup_removed_streams_total counter\n";
+    body << "otts_cleanup_removed_streams_total " << cleanup.removed_streams << "\n";
+    body << "# HELP otts_cleanup_removed_sessions_total External sessions removed by cleanup.\n";
+    body << "# TYPE otts_cleanup_removed_sessions_total counter\n";
+    body << "otts_cleanup_removed_sessions_total " << cleanup.removed_external_sessions << "\n";
     return body.str();
 }
 
