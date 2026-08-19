@@ -9,7 +9,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cstring>
+#include <netinet/tcp.h>
 #include <random>
 #include <sstream>
 #include <thread>
@@ -31,12 +33,15 @@ constexpr std::uint8_t kMessageAmf0Data = 18;
 constexpr std::uint8_t kMessageAmf0Command = 20;
 
 constexpr std::uint16_t kUserControlStreamBegin = 0;
+constexpr std::uint16_t kUserControlPingRequest = 6;
+constexpr std::uint16_t kUserControlPingResponse = 7;
+constexpr std::size_t kMaxOutboundQueueBytes = 8 * 1024 * 1024;
 
-ssize_t send_without_sigpipe(int socket_fd, const void* data, std::size_t size) {
+ssize_t send_without_sigpipe(int socket_fd, const void* data, std::size_t size, int flags = 0) {
 #ifdef MSG_NOSIGNAL
-    return ::send(socket_fd, data, size, MSG_NOSIGNAL);
+    return ::send(socket_fd, data, size, flags | MSG_NOSIGNAL);
 #else
-    return ::send(socket_fd, data, size, 0);
+    return ::send(socket_fd, data, size, flags);
 #endif
 }
 
@@ -122,11 +127,20 @@ std::pair<std::string, std::string> normalize_publish_target(
 
 RtmpSession::RtmpSession(int socket_fd, std::string client_ip, StreamRegistry& registry)
     : socket_fd_(socket_fd), client_ip_(std::move(client_ip)), registry_(registry) {
-    timeval timeout{};
-    timeout.tv_sec = 30;
-    timeout.tv_usec = 0;
-    ::setsockopt(socket_fd_, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-    ::setsockopt(socket_fd_, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+    // RTMP players may legitimately send no control message for a long time.
+    // TCP keepalive detects dead peers without turning an idle player into a
+    // false disconnect after a fixed receive timeout.
+    int keepalive = 1;
+    ::setsockopt(socket_fd_, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
+    int keepidle = 60;
+    int keepintvl = 15;
+    int keepcnt = 4;
+    ::setsockopt(socket_fd_, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle, sizeof(keepidle));
+    ::setsockopt(socket_fd_, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl));
+    ::setsockopt(socket_fd_, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt));
+    timeval send_timeout{};
+    send_timeout.tv_sec = 5;
+    ::setsockopt(socket_fd_, SOL_SOCKET, SO_SNDTIMEO, &send_timeout, sizeof(send_timeout));
 }
 
 RtmpSession::~RtmpSession() {
@@ -140,6 +154,7 @@ RtmpSession::~RtmpSession() {
 
 void RtmpSession::start() {
     running_.store(true);
+    std::thread([self = shared_from_this()] { self->outbound_loop(); }).detach();
     std::thread([self = shared_from_this()] {
         if (!self->perform_handshake()) {
             otts::core::log_warn("rtmp_session", "handshake failed for " + self->client_ip_);
@@ -165,6 +180,7 @@ void RtmpSession::stop() {
         ::close(socket_fd_);
         socket_fd_ = -1;
     }
+    outbound_cv_.notify_all();
 
     otts::core::log_info("rtmp_session", "closed " + client_ip_);
 }
@@ -225,6 +241,26 @@ void RtmpSession::session_loop() {
     stop();
 }
 
+void RtmpSession::outbound_loop() {
+    while (running_.load()) {
+        MediaMessage message;
+        {
+            std::unique_lock<std::mutex> lock(outbound_mutex_);
+            outbound_cv_.wait(lock, [&]() { return !running_.load() || !outbound_queue_.empty(); });
+            if (!running_.load() && outbound_queue_.empty()) {
+                return;
+            }
+            message = std::move(outbound_queue_.front());
+            outbound_queue_.pop_front();
+            outbound_queue_bytes_ -= message.payload.size();
+        }
+        if (!send_chunked_message(6, message)) {
+            stop();
+            return;
+        }
+    }
+}
+
 bool RtmpSession::receive_message(MediaMessage& message) {
     std::uint8_t basic_header = 0;
     if (!read_exact(&basic_header, 1)) {
@@ -233,12 +269,23 @@ bool RtmpSession::receive_message(MediaMessage& message) {
 
     const std::uint8_t fmt = (basic_header >> 6) & 0x03;
     std::uint32_t chunk_stream_id = basic_header & 0x3F;
-    if (chunk_stream_id == 0 || chunk_stream_id == 1) {
-        otts::core::log_warn("rtmp_session", "extended csid not implemented");
-        return false;
+    if (chunk_stream_id == 0) {
+        std::uint8_t extended_csid = 0;
+        if (!read_exact(&extended_csid, 1)) {
+            return false;
+        }
+        chunk_stream_id = 64u + extended_csid;
+    } else if (chunk_stream_id == 1) {
+        std::uint8_t extended_csid[2]{};
+        if (!read_exact(extended_csid, sizeof(extended_csid))) {
+            return false;
+        }
+        chunk_stream_id = 64u + extended_csid[0] + (static_cast<std::uint32_t>(extended_csid[1]) << 8u);
     }
 
     auto& state = chunk_states_[chunk_stream_id];
+    const bool continuing_message = !state.payload.empty();
+    bool read_extended_timestamp = false;
 
     if (fmt <= 2) {
         std::uint8_t message_header[11]{};
@@ -256,7 +303,11 @@ bool RtmpSession::receive_message(MediaMessage& message) {
         }
 
         if (fmt == 0) {
-            state.timestamp = read_be24(message_header);
+            const auto timestamp_field = read_be24(message_header);
+            state.extended_timestamp = timestamp_field == 0xFFFFFF;
+            state.timestamp_is_delta = false;
+            state.timestamp = state.extended_timestamp ? 0 : timestamp_field;
+            state.timestamp_delta = 0;
             state.message_length = read_be24(message_header + 3);
             state.type_id = message_header[6];
             state.message_stream_id = read_le32(message_header + 7);
@@ -264,30 +315,64 @@ bool RtmpSession::receive_message(MediaMessage& message) {
             state.payload.reserve(state.message_length);
             state.header_ready = true;
         } else if (fmt == 1) {
-            state.timestamp_delta = read_be24(message_header);
-            state.timestamp += state.timestamp_delta;
+            const auto timestamp_field = read_be24(message_header);
+            state.extended_timestamp = timestamp_field == 0xFFFFFF;
+            state.timestamp_is_delta = true;
+            state.timestamp_delta = state.extended_timestamp ? 0 : timestamp_field;
+            if (!state.extended_timestamp) {
+                state.timestamp += state.timestamp_delta;
+            }
             state.message_length = read_be24(message_header + 3);
             state.type_id = message_header[6];
             state.payload.clear();
             state.payload.reserve(state.message_length);
             state.header_ready = true;
         } else if (fmt == 2) {
-            state.timestamp_delta = read_be24(message_header);
-            state.timestamp += state.timestamp_delta;
+            const auto timestamp_field = read_be24(message_header);
+            state.extended_timestamp = timestamp_field == 0xFFFFFF;
+            state.timestamp_is_delta = true;
+            state.timestamp_delta = state.extended_timestamp ? 0 : timestamp_field;
+            if (!state.extended_timestamp) {
+                state.timestamp += state.timestamp_delta;
+            }
             state.payload.clear();
             state.payload.reserve(state.message_length);
             state.header_ready = true;
         }
+        read_extended_timestamp = state.extended_timestamp;
     } else if (!state.header_ready) {
         return false;
+    } else {
+        read_extended_timestamp = state.extended_timestamp;
+        if (!continuing_message && state.timestamp_is_delta && !state.extended_timestamp) {
+            state.timestamp += state.timestamp_delta;
+        }
     }
 
-    if (state.timestamp >= 0xFFFFFF) {
+    if (read_extended_timestamp) {
         std::uint8_t extended_timestamp[4]{};
         if (!read_exact(extended_timestamp, 4)) {
             return false;
         }
-        state.timestamp = ntohl(*reinterpret_cast<std::uint32_t*>(extended_timestamp));
+        const auto timestamp_value =
+            (static_cast<std::uint32_t>(extended_timestamp[0]) << 24u) |
+            (static_cast<std::uint32_t>(extended_timestamp[1]) << 16u) |
+            (static_cast<std::uint32_t>(extended_timestamp[2]) << 8u) |
+            static_cast<std::uint32_t>(extended_timestamp[3]);
+        if (fmt == 0) {
+            state.timestamp = timestamp_value;
+        } else if (fmt <= 2) {
+            state.timestamp_delta = timestamp_value;
+            state.timestamp += state.timestamp_delta;
+        } else if (!continuing_message && state.timestamp_is_delta) {
+            state.timestamp_delta = timestamp_value;
+            state.timestamp += state.timestamp_delta;
+        }
+    }
+
+    if (state.message_length > 32 * 1024 * 1024 || state.payload.size() > state.message_length) {
+        otts::core::log_warn("rtmp_session", "invalid RTMP message length");
+        return false;
     }
 
     const std::size_t remaining = state.message_length - state.payload.size();
@@ -403,7 +488,28 @@ void RtmpSession::handle_control_message(const MediaMessage& message) {
     if (message.type_id == kMessageSetChunkSize && message.payload.size() >= 4) {
         inbound_chunk_size_ = (message.payload[0] << 24) | (message.payload[1] << 16) |
                               (message.payload[2] << 8) | message.payload[3];
+        if (inbound_chunk_size_ == 0 || inbound_chunk_size_ > 16 * 1024 * 1024) {
+            otts::core::log_warn("rtmp_session", "invalid inbound chunk size");
+            running_.store(false);
+            return;
+        }
         otts::core::log_info("rtmp_session", "updated inbound chunk size to " + std::to_string(inbound_chunk_size_));
+        return;
+    }
+
+    if (message.type_id == kMessageUserControl && message.payload.size() >= 6) {
+        const auto event_type = static_cast<std::uint16_t>(
+            (static_cast<std::uint16_t>(message.payload[0]) << 8u) | message.payload[1]);
+        if (event_type == kUserControlPingRequest) {
+            MediaMessage response;
+            response.type_id = kMessageUserControl;
+            response.message_stream_id = 0;
+            response.payload.reserve(6);
+            response.payload.push_back(static_cast<std::uint8_t>((kUserControlPingResponse >> 8u) & 0xffu));
+            response.payload.push_back(static_cast<std::uint8_t>(kUserControlPingResponse & 0xffu));
+            response.payload.insert(response.payload.end(), message.payload.begin() + 2, message.payload.begin() + 6);
+            send_chunked_message(2, response);
+        }
     }
 }
 
@@ -573,6 +679,9 @@ bool RtmpSession::read_exact(std::uint8_t* buffer, std::size_t size) {
     std::size_t total = 0;
     while (total < size) {
         const auto bytes = ::recv(socket_fd_, buffer + total, size - total, 0);
+        if (bytes < 0 && errno == EINTR) {
+            continue;
+        }
         if (bytes <= 0) {
             return false;
         }
@@ -585,6 +694,9 @@ bool RtmpSession::write_all(const std::uint8_t* data, std::size_t size) {
     std::size_t total = 0;
     while (total < size) {
         const auto bytes = send_without_sigpipe(socket_fd_, data + total, size - total);
+        if (bytes < 0 && errno == EINTR) {
+            continue;
+        }
         if (bytes <= 0) {
             return false;
         }
@@ -701,12 +813,29 @@ void RtmpSession::send_simple_result(double transaction_id, const Amf0Value& val
 }
 
 void RtmpSession::send_media(const MediaMessage& message) {
+    if (!running_.load()) {
+        return;
+    }
     MediaMessage copy = message;
     copy.message_stream_id = play_stream_id_;
-    send_chunked_message(6, copy);
+    bool overflow = false;
+    {
+        std::lock_guard<std::mutex> lock(outbound_mutex_);
+        overflow = outbound_queue_bytes_ + copy.payload.size() > kMaxOutboundQueueBytes;
+        if (!overflow) {
+            outbound_queue_bytes_ += copy.payload.size();
+            outbound_queue_.push_back(std::move(copy));
+        }
+    }
+    if (overflow) {
+        otts::core::log_warn("rtmp_session", "disconnecting slow player queue_bytes=" + std::to_string(outbound_queue_bytes_));
+        stop();
+        return;
+    }
+    outbound_cv_.notify_one();
 }
 
-void RtmpSession::send_chunked_message(std::uint32_t chunk_stream_id, const MediaMessage& message) {
+bool RtmpSession::send_chunked_message(std::uint32_t chunk_stream_id, const MediaMessage& message) {
     std::lock_guard<std::mutex> lock(write_mutex_);
 
     std::vector<std::uint8_t> out;
@@ -743,7 +872,7 @@ void RtmpSession::send_chunked_message(std::uint32_t chunk_stream_id, const Medi
         }
     }
 
-    write_all(out.data(), out.size());
+    return write_all(out.data(), out.size());
 }
 
 std::uint32_t RtmpSession::read_be24(const std::uint8_t* data) {

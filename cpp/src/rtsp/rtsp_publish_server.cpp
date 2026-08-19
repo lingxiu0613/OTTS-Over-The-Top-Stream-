@@ -311,6 +311,9 @@ void extract_sets_from_annexb(const std::vector<std::uint8_t>& au, NalSets& sets
         while (end + 3 < au.size() && !(au[end] == 0 && au[end + 1] == 0 && (au[end + 2] == 1 || (end + 3 < au.size() && au[end + 2] == 0 && au[end + 3] == 1)))) {
             ++end;
         }
+        if (end + 3 >= au.size()) {
+            end = au.size();
+        }
         if (end > start) {
             const auto type = au[start] & 0x1f;
             if (type == 7) {
@@ -354,8 +357,8 @@ std::vector<std::uint8_t> annexb_to_avcc(const std::vector<std::uint8_t>& au) {
         while (end + 3 < au.size() && !(au[end] == 0 && au[end + 1] == 0 && (au[end + 2] == 1 || (end + 3 < au.size() && au[end + 2] == 0 && au[end + 3] == 1)))) {
             ++end;
         }
-        while (end < au.size() && au[end] == 0) {
-            ++end;
+        if (end + 3 >= au.size()) {
+            end = au.size();
         }
         const auto size = end > start ? end - start : 0;
         if (size > 0) {
@@ -386,13 +389,24 @@ otts::rtmp::MediaMessage make_avc_sequence_header(std::uint32_t timestamp, const
     return message;
 }
 
-otts::rtmp::MediaMessage make_avc_nalu_message(std::uint32_t timestamp, const std::vector<std::uint8_t>& au) {
+void write_signed_be24(std::vector<std::uint8_t>& out, std::int32_t value) {
+    const auto masked = static_cast<std::uint32_t>(value) & 0x00ffffff;
+    out.push_back(static_cast<std::uint8_t>((masked >> 16) & 0xff));
+    out.push_back(static_cast<std::uint8_t>((masked >> 8) & 0xff));
+    out.push_back(static_cast<std::uint8_t>(masked & 0xff));
+}
+
+otts::rtmp::MediaMessage make_avc_nalu_message(
+    std::uint32_t dts_ms,
+    std::int32_t composition_time_ms,
+    const std::vector<std::uint8_t>& au) {
     otts::rtmp::MediaMessage message;
-    message.timestamp = timestamp;
+    message.timestamp = dts_ms;
     message.type_id = 9;
     message.message_stream_id = 1;
     message.payload.push_back(static_cast<std::uint8_t>((has_idr(au) ? 0x10 : 0x20) | 0x07));
-    message.payload.insert(message.payload.end(), {0x01, 0x00, 0x00, 0x00});
+    message.payload.push_back(0x01);
+    write_signed_be24(message.payload, composition_time_ms);
     auto avcc = annexb_to_avcc(au);
     message.payload.insert(message.payload.end(), avcc.begin(), avcc.end());
     return message;
@@ -428,10 +442,6 @@ public:
             (static_cast<std::uint32_t>(packet[5]) << 16) |
             (static_cast<std::uint32_t>(packet[6]) << 8) |
             static_cast<std::uint32_t>(packet[7]);
-        if (!base_ts_.has_value()) {
-            base_ts_ = rtp_ts;
-        }
-        const auto timestamp_ms = static_cast<std::uint32_t>((static_cast<std::uint64_t>(rtp_ts - *base_ts_) * 1000) / 90000);
         const auto* payload = packet + offset;
         const auto payload_size = size - offset;
         if (payload_size == 0) {
@@ -465,12 +475,33 @@ public:
         }
 
         if (marker && !current_au_.empty()) {
+            const auto timestamp_ms = next_monotonic_timestamp_ms(rtp_ts);
             publish(timestamp_ms);
             current_au_.clear();
         }
     }
 
 private:
+    std::uint32_t next_monotonic_timestamp_ms(std::uint32_t rtp_ts) {
+        if (!last_rtp_ts_.has_value()) {
+            last_rtp_ts_ = rtp_ts;
+            monotonic_timestamp_ms_ = 0;
+            return *monotonic_timestamp_ms_;
+        }
+        std::uint32_t delta_ms = frame_interval_ms_;
+        if (rtp_ts >= *last_rtp_ts_) {
+            const auto observed_ms = static_cast<std::uint32_t>(
+                (static_cast<std::uint64_t>(rtp_ts - *last_rtp_ts_) * 1000) / 90000);
+            if (observed_ms >= 10 && observed_ms <= 100) {
+                delta_ms = observed_ms;
+                frame_interval_ms_ = observed_ms;
+            }
+        }
+        *monotonic_timestamp_ms_ += delta_ms;
+        last_rtp_ts_ = rtp_ts;
+        return *monotonic_timestamp_ms_;
+    }
+
     void append_start_code() {
         current_au_.insert(current_au_.end(), {0x00, 0x00, 0x00, 0x01});
     }
@@ -485,7 +516,18 @@ private:
                 make_avc_sequence_header(timestamp_ms, sets_));
             sent_sequence_ = true;
         }
-        auto message = make_avc_nalu_message(timestamp_ms, current_au_);
+        if (last_pts_ms_.has_value() && timestamp_ms > *last_pts_ms_) {
+            frame_interval_ms_ = std::max<std::uint32_t>(1, timestamp_ms - *last_pts_ms_);
+        }
+        std::uint32_t dts_ms = timestamp_ms;
+        if (last_dts_ms_.has_value() && dts_ms <= *last_dts_ms_) {
+            dts_ms = *last_dts_ms_ + frame_interval_ms_;
+        }
+        const auto composition_time_ms =
+            static_cast<std::int32_t>(timestamp_ms) - static_cast<std::int32_t>(dts_ms);
+        last_pts_ms_ = timestamp_ms;
+        last_dts_ms_ = dts_ms;
+        auto message = make_avc_nalu_message(dts_ms, composition_time_ms, current_au_);
         if (message.payload.size() > 5) {
             registry_.publish_external_media(stream_key_, otts::media::StreamSource::Rtsp, "cpp-rtsp-native-publish", message);
         }
@@ -494,7 +536,11 @@ private:
     otts::rtmp::StreamRegistry& registry_;
     std::string stream_key_;
     NalSets sets_;
-    std::optional<std::uint32_t> base_ts_;
+    std::optional<std::uint32_t> last_rtp_ts_;
+    std::optional<std::uint32_t> monotonic_timestamp_ms_;
+    std::optional<std::uint32_t> last_pts_ms_;
+    std::optional<std::uint32_t> last_dts_ms_;
+    std::uint32_t frame_interval_ms_{33};
     std::vector<std::uint8_t> current_au_;
     bool sent_sequence_{false};
 };
@@ -567,24 +613,38 @@ void RtspPublishServer::handle_client(int client_fd) {
     std::string buffer;
     std::string stream_key;
     NalSets sets;
-    std::uint16_t rtp_port = 0;
-    std::uint16_t rtcp_port = 0;
-    int rtp_fd = -1;
-    int rtcp_fd = -1;
+    std::uint16_t video_rtp_port = 0;
+    std::uint16_t video_rtcp_port = 0;
+    int video_rtp_fd = -1;
+    int video_rtcp_fd = -1;
+    std::uint16_t audio_rtp_port = 0;
+    std::uint16_t audio_rtcp_port = 0;
+    int audio_rtp_fd = -1;
+    int audio_rtcp_fd = -1;
     std::atomic<bool> receiving{false};
     std::thread receiver;
 
     auto cleanup = [&]() {
         receiving.store(false);
-        if (rtp_fd >= 0) {
-            ::shutdown(rtp_fd, SHUT_RDWR);
-            ::close(rtp_fd);
-            rtp_fd = -1;
+        if (video_rtp_fd >= 0) {
+            ::shutdown(video_rtp_fd, SHUT_RDWR);
+            ::close(video_rtp_fd);
+            video_rtp_fd = -1;
         }
-        if (rtcp_fd >= 0) {
-            ::shutdown(rtcp_fd, SHUT_RDWR);
-            ::close(rtcp_fd);
-            rtcp_fd = -1;
+        if (video_rtcp_fd >= 0) {
+            ::shutdown(video_rtcp_fd, SHUT_RDWR);
+            ::close(video_rtcp_fd);
+            video_rtcp_fd = -1;
+        }
+        if (audio_rtp_fd >= 0) {
+            ::shutdown(audio_rtp_fd, SHUT_RDWR);
+            ::close(audio_rtp_fd);
+            audio_rtp_fd = -1;
+        }
+        if (audio_rtcp_fd >= 0) {
+            ::shutdown(audio_rtcp_fd, SHUT_RDWR);
+            ::close(audio_rtcp_fd);
+            audio_rtcp_fd = -1;
         }
         if (receiver.joinable()) {
             receiver.join();
@@ -674,25 +734,43 @@ void RtspPublishServer::handle_client(int client_fd) {
                     send_all(client_fd, response_text("461 Unsupported Transport", cseq));
                     continue;
                 }
+                const auto uri_lower = lower(request->uri);
+                const bool is_audio_track =
+                    uri_lower.find("trackid=1") != std::string::npos ||
+                    uri_lower.find("streamid=1") != std::string::npos ||
+                    uri_lower.find("stream=1") != std::string::npos ||
+                    uri_lower.find("/audio") != std::string::npos;
+                std::uint16_t* target_rtp_port = is_audio_track ? &audio_rtp_port : &video_rtp_port;
+                std::uint16_t* target_rtcp_port = is_audio_track ? &audio_rtcp_port : &video_rtcp_port;
+                int* target_rtp_fd = is_audio_track ? &audio_rtp_fd : &video_rtp_fd;
+                int* target_rtcp_fd = is_audio_track ? &audio_rtcp_fd : &video_rtcp_fd;
+                if (*target_rtp_fd >= 0) {
+                    ::close(*target_rtp_fd);
+                    *target_rtp_fd = -1;
+                }
+                if (*target_rtcp_fd >= 0) {
+                    ::close(*target_rtcp_fd);
+                    *target_rtcp_fd = -1;
+                }
                 for (int attempt = 0; attempt < 32; ++attempt) {
-                    rtp_port = 0;
-                    rtp_fd = bind_udp_port(rtp_port);
-                    if (rtp_fd < 0 || (rtp_port % 2) != 0) {
-                        if (rtp_fd >= 0) {
-                            ::close(rtp_fd);
-                            rtp_fd = -1;
+                    *target_rtp_port = 0;
+                    *target_rtp_fd = bind_udp_port(*target_rtp_port);
+                    if (*target_rtp_fd < 0 || (*target_rtp_port % 2) != 0) {
+                        if (*target_rtp_fd >= 0) {
+                            ::close(*target_rtp_fd);
+                            *target_rtp_fd = -1;
                         }
                         continue;
                     }
-                    rtcp_port = static_cast<std::uint16_t>(rtp_port + 1);
-                    rtcp_fd = bind_udp_port(rtcp_port);
-                    if (rtcp_fd >= 0) {
+                    *target_rtcp_port = static_cast<std::uint16_t>(*target_rtp_port + 1);
+                    *target_rtcp_fd = bind_udp_port(*target_rtcp_port);
+                    if (*target_rtcp_fd >= 0) {
                         break;
                     }
-                    ::close(rtp_fd);
-                    rtp_fd = -1;
+                    ::close(*target_rtp_fd);
+                    *target_rtp_fd = -1;
                 }
-                if (rtp_fd < 0 || rtcp_fd < 0) {
+                if (*target_rtp_fd < 0 || *target_rtcp_fd < 0) {
                     send_all(client_fd, response_text("500 Internal Server Error", cseq));
                     continue;
                 }
@@ -719,17 +797,17 @@ void RtspPublishServer::handle_client(int client_fd) {
                 std::ostringstream transport_response;
                 const auto ports = parse_client_ports(transport->second).value();
                 transport_response << "RTP/AVP/UDP;unicast;client_port=" << ports.first << "-" << ports.second
-                                   << ";server_port=" << rtp_port << "-" << rtcp_port;
+                                   << ";server_port=" << *target_rtp_port << "-" << *target_rtcp_port;
                 send_all(client_fd, response_text("200 OK", cseq, {{"Session", session_id}, {"Transport", transport_response.str()}}));
                 continue;
             }
             if (request->method == "RECORD") {
-                if (rtp_fd < 0) {
+                if (video_rtp_fd < 0) {
                     send_all(client_fd, response_text("455 Method Not Valid in This State", cseq));
                     continue;
                 }
                 receiving.store(true);
-                receiver = std::thread([&, local_rtp_fd = rtp_fd]() {
+                receiver = std::thread([&, local_rtp_fd = video_rtp_fd]() {
                     H264RtpIngest ingest(registry_, stream_key, sets);
                     std::array<std::uint8_t, 2048> packet{};
                     while (receiving.load()) {

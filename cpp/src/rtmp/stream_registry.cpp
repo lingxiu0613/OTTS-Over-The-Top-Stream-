@@ -209,30 +209,23 @@ void StreamRegistry::add_callback_subscriber(
         std::lock_guard<std::mutex> lock(mutex_);
         auto& stream = streams_[stream_key];
         stream.callback_subscribers.push_back(CallbackSubscriber{callback_id, callback});
-
-        if (stream.metadata) {
-            cached_messages.push_back(*stream.metadata);
-        }
-        if (stream.audio_sequence_header) {
-            cached_messages.push_back(*stream.audio_sequence_header);
-        }
-        if (stream.video_sequence_header) {
-            cached_messages.push_back(*stream.video_sequence_header);
-        }
-        for (const auto& packet : stream.gop_cache.packets()) {
-            MediaMessage media_message;
-            media_message.timestamp = packet.timestamp_ms;
-            media_message.type_id = packet.kind == otts::media::MediaKind::Video ? 9 : 8;
-            media_message.message_stream_id = packet.message_stream_id;
-            media_message.payload = packet.payload;
-            cached_messages.push_back(std::move(media_message));
-        }
+        cached_messages = snapshot_cached_messages_locked(stream);
         persist_state_locked();
     }
 
     for (const auto& message : cached_messages) {
         callback(message);
     }
+}
+
+void StreamRegistry::add_live_callback_subscriber(
+    const std::string& stream_key,
+    CallbackId callback_id,
+    MediaCallback callback) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto& stream = streams_[stream_key];
+    stream.callback_subscribers.push_back(CallbackSubscriber{callback_id, callback});
+    persist_state_locked();
 }
 
 void StreamRegistry::remove_callback_subscriber(const std::string& stream_key, CallbackId callback_id) {
@@ -269,7 +262,7 @@ void StreamRegistry::publish_media(const std::string& stream_key, const MediaMes
             return;
         }
         publish_media_locked(stream_key, it->second, message, subscribers, callbacks);
-        persist_state_locked();
+        persist_media_state_if_due_locked();
     }
 
     otts::core::log_debug(
@@ -306,7 +299,7 @@ void StreamRegistry::publish_external_media(
         stream.audio_track.kind = otts::media::MediaKind::Audio;
         stream.video_track.kind = otts::media::MediaKind::Video;
         publish_media_locked(stream_key, stream, message, subscribers, callbacks);
-        persist_state_locked();
+        persist_media_state_if_due_locked();
     }
 
     for (const auto& subscriber : subscribers) {
@@ -542,6 +535,15 @@ std::vector<StreamRegistry::ExternalSessionSnapshot> StreamRegistry::external_se
             return left.session_key < right.session_key;
         });
     return result;
+}
+
+std::vector<MediaMessage> StreamRegistry::cached_messages(const std::string& stream_key) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = streams_.find(stream_key);
+    if (it == streams_.end()) {
+        return {};
+    }
+    return snapshot_cached_messages_locked(it->second);
 }
 
 StreamRegistry::CleanupStats StreamRegistry::cleanup_stale(
@@ -783,10 +785,10 @@ void StreamRegistry::publish_media_locked(
 
     if (is_audio_sequence_header(message)) {
         stream.audio_sequence_header = message;
-        otts::core::log_info("stream_registry", "cached audio sequence header key=" + stream_key);
+        otts::core::log_debug("stream_registry", "cached audio sequence header key=" + stream_key);
     } else if (is_video_sequence_header(message)) {
         stream.video_sequence_header = message;
-        otts::core::log_info("stream_registry", "cached video sequence header key=" + stream_key);
+        otts::core::log_debug("stream_registry", "cached video sequence header key=" + stream_key);
     }
 
     if (message.type_id == 9 || message.type_id == 8) {
@@ -798,7 +800,7 @@ void StreamRegistry::publish_media_locked(
             stream.video_bytes += payload_size;
         }
         if (packet.kind == otts::media::MediaKind::Video && packet.is_keyframe) {
-            otts::core::log_info("stream_registry", "reset GOP cache at keyframe key=" + stream_key);
+            otts::core::log_debug("stream_registry", "reset GOP cache at keyframe key=" + stream_key);
         }
         stream.gop_cache.add(packet);
     } else if (message.type_id != 18) {
@@ -824,6 +826,17 @@ void StreamRegistry::publish_media_locked(
     for (const auto& subscriber : stream.callback_subscribers) {
         callbacks.push_back(subscriber.callback);
     }
+}
+
+void StreamRegistry::persist_media_state_if_due_locked() {
+    constexpr std::uint64_t kMediaStatePersistIntervalMs = 1000;
+    const auto now_ms = now_epoch_ms();
+    if (last_media_state_persist_epoch_ms_ != 0 &&
+        now_ms - last_media_state_persist_epoch_ms_ < kMediaStatePersistIntervalMs) {
+        return;
+    }
+    last_media_state_persist_epoch_ms_ = now_ms;
+    persist_state_locked();
 }
 
 void StreamRegistry::persist_state_locked() const {
@@ -1025,6 +1038,28 @@ otts::media::MediaPacket StreamRegistry::to_media_packet(const MediaMessage& mes
 
     packet.kind = otts::media::MediaKind::Data;
     return packet;
+}
+
+std::vector<MediaMessage> StreamRegistry::snapshot_cached_messages_locked(const StreamState& stream) {
+    std::vector<MediaMessage> cached_messages;
+    if (stream.metadata) {
+        cached_messages.push_back(*stream.metadata);
+    }
+    if (stream.audio_sequence_header) {
+        cached_messages.push_back(*stream.audio_sequence_header);
+    }
+    if (stream.video_sequence_header) {
+        cached_messages.push_back(*stream.video_sequence_header);
+    }
+    for (const auto& packet : stream.gop_cache.packets()) {
+        MediaMessage media_message;
+        media_message.timestamp = packet.timestamp_ms;
+        media_message.type_id = packet.kind == otts::media::MediaKind::Video ? 9 : 8;
+        media_message.message_stream_id = packet.message_stream_id;
+        media_message.payload = packet.payload;
+        cached_messages.push_back(std::move(media_message));
+    }
+    return cached_messages;
 }
 
 }  // namespace otts::rtmp

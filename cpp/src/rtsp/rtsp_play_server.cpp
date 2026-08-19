@@ -14,7 +14,9 @@
 #include <array>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <optional>
 #include <random>
@@ -103,6 +105,17 @@ void write_be32(std::vector<std::uint8_t>& out, std::uint32_t value) {
     out.push_back(static_cast<std::uint8_t>((value >> 16) & 0xff));
     out.push_back(static_cast<std::uint8_t>((value >> 8) & 0xff));
     out.push_back(static_cast<std::uint8_t>(value & 0xff));
+}
+
+std::int32_t read_signed_be24(const std::uint8_t* data) {
+    std::int32_t value =
+        (static_cast<std::int32_t>(data[0]) << 16) |
+        (static_cast<std::int32_t>(data[1]) << 8) |
+        static_cast<std::int32_t>(data[2]);
+    if ((value & 0x00800000) != 0) {
+        value |= ~0x00ffffff;
+    }
+    return value;
 }
 
 std::string stream_key_from_uri(std::string uri) {
@@ -292,7 +305,10 @@ public:
         if (codec_id != 7 || avc_packet_type != 1) {
             return;
         }
-        const auto rtp_timestamp = static_cast<std::uint32_t>((static_cast<std::uint64_t>(message.timestamp) * clock_rate_) / 1000);
+        const auto composition_time_ms = read_signed_be24(message.payload.data() + 2);
+        const auto present_time_ms = static_cast<std::int64_t>(message.timestamp) + static_cast<std::int64_t>(composition_time_ms);
+        const auto normalized_present_time_ms = static_cast<std::uint32_t>(std::max<std::int64_t>(0, present_time_ms));
+        const auto rtp_timestamp = next_media_rtp_timestamp(normalized_present_time_ms, 33);
         std::size_t cursor = 5;
         while (cursor + 4 <= message.payload.size()) {
             const auto nal_size = read_be32(message.payload.data() + cursor);
@@ -300,7 +316,8 @@ public:
             if (nal_size == 0 || cursor + nal_size > message.payload.size()) {
                 break;
             }
-            send_nal(message.payload.data() + cursor, nal_size, rtp_timestamp);
+            const bool last_nal = (cursor + nal_size) >= message.payload.size();
+            send_nal(message.payload.data() + cursor, nal_size, rtp_timestamp, last_nal);
             cursor += nal_size;
         }
     }
@@ -324,11 +341,34 @@ public:
         const auto au_header = static_cast<std::uint16_t>((raw_size * 8) << 3);
         write_be16(payload, au_header);
         payload.insert(payload.end(), message.payload.begin() + 2, message.payload.end());
-        const auto rtp_timestamp = static_cast<std::uint32_t>((static_cast<std::uint64_t>(message.timestamp) * clock_rate_) / 1000);
+        const auto default_audio_delta_ms =
+            std::max<std::uint32_t>(1, static_cast<std::uint32_t>((1024ULL * 1000ULL) / std::max<std::uint32_t>(1, clock_rate_)));
+        const auto rtp_timestamp = next_media_rtp_timestamp(message.timestamp, default_audio_delta_ms);
         send_packet(payload.data(), payload.size(), rtp_timestamp, true);
     }
 
 private:
+    std::uint32_t next_media_rtp_timestamp(std::uint32_t input_timestamp_ms, std::uint32_t default_delta_ms) {
+        if (!last_input_timestamp_ms_.has_value()) {
+            last_input_timestamp_ms_ = input_timestamp_ms;
+            rtp_timestamp_accumulator_ = static_cast<std::uint32_t>(
+                (static_cast<std::uint64_t>(input_timestamp_ms) * clock_rate_) / 1000);
+            return *rtp_timestamp_accumulator_;
+        }
+
+        std::uint32_t delta_ms = default_delta_ms;
+        if (input_timestamp_ms > *last_input_timestamp_ms_) {
+            const auto observed = input_timestamp_ms - *last_input_timestamp_ms_;
+            if (observed >= 10 && observed <= 50) {
+                delta_ms = observed;
+            }
+        }
+        last_input_timestamp_ms_ = input_timestamp_ms;
+        rtp_timestamp_accumulator_ = *rtp_timestamp_accumulator_ +
+                                     static_cast<std::uint32_t>((static_cast<std::uint64_t>(delta_ms) * clock_rate_) / 1000);
+        return *rtp_timestamp_accumulator_;
+    }
+
     void send_packet(const std::uint8_t* payload, std::size_t size, std::uint32_t timestamp, bool marker) {
         std::vector<std::uint8_t> packet;
         packet.reserve(12 + size);
@@ -348,16 +388,25 @@ private:
             frame.push_back(interleaved_channel_);
             write_be16(frame, static_cast<std::uint16_t>(packet.size()));
             frame.insert(frame.end(), packet.begin(), packet.end());
-            ::send(control_fd_, frame.data(), frame.size(), MSG_NOSIGNAL);
+            // A slow TCP-interleaved reader must not block the registry's
+            // media fanout thread. Drop the current RTP frame if the kernel
+            // send queue is full; the next keyframe lets the reader recover.
+            const auto sent = ::send(control_fd_, frame.data(), frame.size(), MSG_NOSIGNAL | MSG_DONTWAIT);
+            if (sent < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
+                return;
+            }
+            if (sent != static_cast<ssize_t>(frame.size())) {
+                ::shutdown(control_fd_, SHUT_RDWR);
+            }
             return;
         }
         ::sendto(socket_fd_, packet.data(), packet.size(), MSG_NOSIGNAL, reinterpret_cast<sockaddr*>(&remote_), sizeof(remote_));
     }
 
-    void send_nal(const std::uint8_t* nal, std::size_t size, std::uint32_t timestamp) {
+    void send_nal(const std::uint8_t* nal, std::size_t size, std::uint32_t timestamp, bool marker) {
         constexpr std::size_t max_payload = 1200;
         if (size <= max_payload) {
-            send_packet(nal, size, timestamp, true);
+            send_packet(nal, size, timestamp, marker);
             return;
         }
         const auto nal_header = nal[0];
@@ -373,7 +422,7 @@ private:
             payload[0] = fu_indicator;
             payload[1] = static_cast<std::uint8_t>((start ? 0x80 : 0x00) | (end ? 0x40 : 0x00) | nal_type);
             std::memcpy(payload.data() + 2, nal + offset, chunk);
-            send_packet(payload.data(), chunk + 2, timestamp, end);
+            send_packet(payload.data(), chunk + 2, timestamp, end && marker);
             start = false;
             offset += chunk;
         }
@@ -389,6 +438,8 @@ private:
     bool use_tcp_{false};
     int control_fd_{-1};
     std::uint8_t interleaved_channel_{0};
+    std::optional<std::uint32_t> last_input_timestamp_ms_;
+    std::optional<std::uint32_t> rtp_timestamp_accumulator_;
 };
 
 }  // namespace
@@ -474,13 +525,88 @@ void RtspPlayServer::handle_client(int client_fd) {
     otts::rtmp::StreamRegistry::CallbackId callback_id = 0;
     bool subscribed = false;
     bool authorized = false;
+    bool playback_running = true;
     std::string session_key = "cpp-rtsp-play:" + session_id;
     std::mutex sender_mutex;
+    std::mutex queue_mutex;
+    std::condition_variable queue_cv;
+    std::deque<otts::rtmp::MediaMessage> pending_messages;
+    std::optional<std::uint32_t> last_playback_timestamp_ms;
+    std::optional<std::chrono::steady_clock::time_point> next_due_time;
+    std::optional<std::chrono::steady_clock::time_point> live_buffer_started_at;
+    bool live_playback_started = false;
+
+    auto playback_worker = std::thread([&]() {
+        while (true) {
+            otts::rtmp::MediaMessage message;
+            {
+                std::unique_lock<std::mutex> lock(queue_mutex);
+                queue_cv.wait(lock, [&]() { return !playback_running || !pending_messages.empty(); });
+                if (!playback_running && pending_messages.empty()) {
+                    break;
+                }
+                if (!live_playback_started) {
+                    if (!live_buffer_started_at.has_value()) {
+                        live_buffer_started_at = std::chrono::steady_clock::now();
+                    }
+                    std::size_t queued_video_messages = 0;
+                    for (const auto& queued : pending_messages) {
+                        if (queued.type_id == 9) {
+                            ++queued_video_messages;
+                        }
+                    }
+                    const auto buffered_for = std::chrono::steady_clock::now() - *live_buffer_started_at;
+                    if (queued_video_messages < 6 && buffered_for < std::chrono::milliseconds(180)) {
+                        queue_cv.wait_for(lock, std::chrono::milliseconds(20));
+                        continue;
+                    }
+                    live_playback_started = true;
+                    next_due_time = std::chrono::steady_clock::now();
+                }
+                message = std::move(pending_messages.front());
+                pending_messages.pop_front();
+            }
+
+            if (message.type_id == 9 || message.type_id == 8) {
+                std::uint32_t default_delta_ms = message.type_id == 9 ? 33U : 23U;
+                std::uint32_t delta_ms = default_delta_ms;
+                if (last_playback_timestamp_ms.has_value() && message.timestamp > *last_playback_timestamp_ms) {
+                    const auto observed = message.timestamp - *last_playback_timestamp_ms;
+                    if (observed >= 10 && observed <= 50) {
+                        delta_ms = observed;
+                    }
+                }
+                if (!next_due_time.has_value()) {
+                    next_due_time = std::chrono::steady_clock::now();
+                } else {
+                    *next_due_time += std::chrono::milliseconds(delta_ms);
+                    std::this_thread::sleep_until(*next_due_time);
+                }
+                last_playback_timestamp_ms = message.timestamp;
+            }
+
+            std::lock_guard<std::mutex> lock(sender_mutex);
+            if (video_setup) {
+                video_sender.send_flv_video(message);
+            }
+            if (audio_setup) {
+                audio_sender.send_flv_aac(message);
+            }
+        }
+    });
 
     auto cleanup = [&]() {
         if (subscribed) {
             registry_.remove_callback_subscriber(stream_key, callback_id);
             subscribed = false;
+        }
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex);
+            playback_running = false;
+        }
+        queue_cv.notify_all();
+        if (playback_worker.joinable()) {
+            playback_worker.join();
         }
         registry_.remove_external_session(session_key);
         video_sender.close();
@@ -625,15 +751,29 @@ void RtspPlayServer::handle_client(int client_fd) {
 
             if (request.method == "PLAY") {
                 if (!subscribed) {
-                    callback_id = next_callback_id_.fetch_add(1);
-                    registry_.add_callback_subscriber(stream_key, callback_id, [&](const otts::rtmp::MediaMessage& message) {
+                    const auto cached_messages = registry_.cached_messages(stream_key);
+                    {
                         std::lock_guard<std::mutex> lock(sender_mutex);
-                        if (video_setup) {
-                            video_sender.send_flv_video(message);
+                        for (const auto& message : cached_messages) {
+                            if (video_setup) {
+                                video_sender.send_flv_video(message);
+                            }
+                            if (audio_setup) {
+                                audio_sender.send_flv_aac(message);
+                            }
                         }
-                        if (audio_setup) {
-                            audio_sender.send_flv_aac(message);
+                    }
+                    last_playback_timestamp_ms.reset();
+                    next_due_time.reset();
+                    live_buffer_started_at.reset();
+                    live_playback_started = false;
+                    callback_id = next_callback_id_.fetch_add(1);
+                    registry_.add_live_callback_subscriber(stream_key, callback_id, [&](const otts::rtmp::MediaMessage& message) {
+                        {
+                            std::lock_guard<std::mutex> lock(queue_mutex);
+                            pending_messages.push_back(message);
                         }
+                        queue_cv.notify_one();
                     });
                     subscribed = true;
                     registry_.upsert_external_session(

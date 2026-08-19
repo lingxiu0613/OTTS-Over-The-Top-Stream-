@@ -4,7 +4,9 @@
 #include "otts/rtmp/stream_registry.hpp"
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -31,10 +33,13 @@ private:
         std::uint32_t message_stream_id{0};
         std::vector<std::uint8_t> payload;
         bool header_ready{false};
+        bool extended_timestamp{false};
+        bool timestamp_is_delta{false};
     };
 
     bool perform_handshake();
     void session_loop();
+    void outbound_loop();
     bool receive_message(MediaMessage& message);
     void handle_message(const MediaMessage& message);
     void handle_command(const MediaMessage& message);
@@ -62,7 +67,7 @@ private:
     void send_on_status(std::uint32_t stream_id, const std::string& code, const std::string& description);
     void send_command_result(double transaction_id, const Amf0Object& properties, const Amf0Object& info);
     void send_simple_result(double transaction_id, const Amf0Value& value);
-    void send_chunked_message(std::uint32_t chunk_stream_id, const MediaMessage& message);
+    bool send_chunked_message(std::uint32_t chunk_stream_id, const MediaMessage& message);
 
     static std::uint32_t read_be24(const std::uint8_t* data);
     static std::uint32_t read_le32(const std::uint8_t* data);
@@ -74,6 +79,10 @@ private:
     StreamRegistry& registry_;
     std::atomic<bool> running_{false};
     std::mutex write_mutex_;
+    std::mutex outbound_mutex_;
+    std::condition_variable outbound_cv_;
+    std::deque<MediaMessage> outbound_queue_;
+    std::size_t outbound_queue_bytes_{0};
 
     std::uint32_t inbound_chunk_size_{128};
     std::uint32_t outbound_chunk_size_{4096};

@@ -113,6 +113,7 @@ public:
     void add_subscriber(const std::string& stream_key, const std::shared_ptr<RtmpSession>& session);
     void remove_subscriber(const std::shared_ptr<RtmpSession>& session);
     void add_callback_subscriber(const std::string& stream_key, CallbackId callback_id, MediaCallback callback);
+    void add_live_callback_subscriber(const std::string& stream_key, CallbackId callback_id, MediaCallback callback);
     void remove_callback_subscriber(const std::string& stream_key, CallbackId callback_id);
     void publish_media(const std::string& stream_key, const MediaMessage& message);
     void publish_external_media(
@@ -157,6 +158,7 @@ public:
     std::size_t viewer_count(const std::string& stream_key);
     std::vector<StreamSnapshot> snapshots() const;
     std::vector<ExternalSessionSnapshot> external_sessions() const;
+    std::vector<MediaMessage> cached_messages(const std::string& stream_key) const;
     CleanupStats cleanup_stale(std::uint64_t external_publisher_idle_ms, std::uint64_t stopped_session_retention_ms);
     CleanupStats cleanup_stats() const;
     std::optional<RtspDescribeInfo> rtsp_describe_info(const std::string& stream_key) const;
@@ -171,11 +173,13 @@ private:
     struct StreamState;
 
     void persist_state_locked() const;
+    void persist_media_state_if_due_locked();
     static std::string json_escape(std::string_view value);
     static bool is_video_sequence_header(const MediaMessage& message);
     static bool is_audio_sequence_header(const MediaMessage& message);
     static bool is_video_keyframe(const MediaMessage& message);
     static otts::media::MediaPacket to_media_packet(const MediaMessage& message);
+    static std::vector<MediaMessage> snapshot_cached_messages_locked(const StreamState& stream);
     void publish_media_locked(
         const std::string& stream_key,
         StreamState& stream,
@@ -238,6 +242,7 @@ private:
     std::unordered_map<std::string, StreamState> streams_;
     std::unordered_map<std::string, ExternalSessionState> external_sessions_;
     CleanupStats cleanup_stats_;
+    std::uint64_t last_media_state_persist_epoch_ms_{0};
 };
 
 }  // namespace otts::rtmp
