@@ -338,16 +338,27 @@ public:
         std::vector<std::uint8_t> payload;
         payload.reserve(4 + raw_size);
         write_be16(payload, 16);
-        const auto au_header = static_cast<std::uint16_t>((raw_size * 8) << 3);
+        // RFC 3640 AU-size is expressed in bytes; the low three bits carry AU-Index.
+        const auto au_header = static_cast<std::uint16_t>(raw_size << 3);
         write_be16(payload, au_header);
         payload.insert(payload.end(), message.payload.begin() + 2, message.payload.end());
-        const auto default_audio_delta_ms =
-            std::max<std::uint32_t>(1, static_cast<std::uint32_t>((1024ULL * 1000ULL) / std::max<std::uint32_t>(1, clock_rate_)));
-        const auto rtp_timestamp = next_media_rtp_timestamp(message.timestamp, default_audio_delta_ms);
+        const auto rtp_timestamp = next_aac_rtp_timestamp(message.timestamp);
         send_packet(payload.data(), payload.size(), rtp_timestamp, true);
     }
 
 private:
+    std::uint32_t next_aac_rtp_timestamp(std::uint32_t input_timestamp_ms) {
+        if (!rtp_timestamp_accumulator_.has_value()) {
+            last_input_timestamp_ms_ = input_timestamp_ms;
+            rtp_timestamp_accumulator_ = static_cast<std::uint32_t>(
+                (static_cast<std::uint64_t>(input_timestamp_ms) * clock_rate_) / 1000);
+            return *rtp_timestamp_accumulator_;
+        }
+        last_input_timestamp_ms_ = input_timestamp_ms;
+        *rtp_timestamp_accumulator_ += 1024;
+        return *rtp_timestamp_accumulator_;
+    }
+
     std::uint32_t next_media_rtp_timestamp(std::uint32_t input_timestamp_ms, std::uint32_t default_delta_ms) {
         if (!last_input_timestamp_ms_.has_value()) {
             last_input_timestamp_ms_ = input_timestamp_ms;
@@ -531,8 +542,8 @@ void RtspPlayServer::handle_client(int client_fd) {
     std::mutex queue_mutex;
     std::condition_variable queue_cv;
     std::deque<otts::rtmp::MediaMessage> pending_messages;
-    std::optional<std::uint32_t> last_playback_timestamp_ms;
-    std::optional<std::chrono::steady_clock::time_point> next_due_time;
+    std::optional<std::uint32_t> media_origin_timestamp_ms;
+    std::optional<std::chrono::steady_clock::time_point> playback_wall_origin;
     std::optional<std::chrono::steady_clock::time_point> live_buffer_started_at;
     bool live_playback_started = false;
 
@@ -551,7 +562,7 @@ void RtspPlayServer::handle_client(int client_fd) {
                     }
                     std::size_t queued_video_messages = 0;
                     for (const auto& queued : pending_messages) {
-                        if (queued.type_id == 9) {
+                        if (queued.type_id == 9 && queued.payload.size() > 1 && queued.payload[1] == 1) {
                             ++queued_video_messages;
                         }
                     }
@@ -561,28 +572,37 @@ void RtspPlayServer::handle_client(int client_fd) {
                         continue;
                     }
                     live_playback_started = true;
-                    next_due_time = std::chrono::steady_clock::now();
                 }
-                message = std::move(pending_messages.front());
-                pending_messages.pop_front();
+                const auto next = std::min_element(
+                    pending_messages.begin(),
+                    pending_messages.end(),
+                    [](const auto& left, const auto& right) { return left.timestamp < right.timestamp; });
+                message = std::move(*next);
+                pending_messages.erase(next);
             }
 
-            if (message.type_id == 9 || message.type_id == 8) {
-                std::uint32_t default_delta_ms = message.type_id == 9 ? 33U : 23U;
-                std::uint32_t delta_ms = default_delta_ms;
-                if (last_playback_timestamp_ms.has_value() && message.timestamp > *last_playback_timestamp_ms) {
-                    const auto observed = message.timestamp - *last_playback_timestamp_ms;
-                    if (observed >= 10 && observed <= 50) {
-                        delta_ms = observed;
+            const bool is_raw_video = message.type_id == 9 && message.payload.size() > 1 && message.payload[1] == 1;
+            const bool is_raw_audio = message.type_id == 8 && message.payload.size() > 1 && message.payload[1] == 1;
+            if (is_raw_video || is_raw_audio) {
+                auto now = std::chrono::steady_clock::now();
+                if (!media_origin_timestamp_ms.has_value() || !playback_wall_origin.has_value()) {
+                    media_origin_timestamp_ms = message.timestamp;
+                    playback_wall_origin = now;
+                }
+                if (message.timestamp >= *media_origin_timestamp_ms) {
+                    auto due = *playback_wall_origin +
+                               std::chrono::milliseconds(message.timestamp - *media_origin_timestamp_ms);
+                    const auto too_far_ahead = due > now + std::chrono::seconds(2);
+                    const auto too_far_behind = due + std::chrono::seconds(2) < now;
+                    if (too_far_ahead || too_far_behind) {
+                        media_origin_timestamp_ms = message.timestamp;
+                        playback_wall_origin = now;
+                        due = now;
+                    }
+                    if (due > now) {
+                        std::this_thread::sleep_until(due);
                     }
                 }
-                if (!next_due_time.has_value()) {
-                    next_due_time = std::chrono::steady_clock::now();
-                } else {
-                    *next_due_time += std::chrono::milliseconds(delta_ms);
-                    std::this_thread::sleep_until(*next_due_time);
-                }
-                last_playback_timestamp_ms = message.timestamp;
             }
 
             std::lock_guard<std::mutex> lock(sender_mutex);
@@ -753,20 +773,18 @@ void RtspPlayServer::handle_client(int client_fd) {
                 if (!subscribed) {
                     const auto cached_messages = registry_.cached_messages(stream_key);
                     {
-                        std::lock_guard<std::mutex> lock(sender_mutex);
+                        std::lock_guard<std::mutex> lock(queue_mutex);
+                        pending_messages.clear();
+                        media_origin_timestamp_ms.reset();
+                        playback_wall_origin.reset();
+                        live_buffer_started_at.reset();
+                        live_playback_started = false;
                         for (const auto& message : cached_messages) {
-                            if (video_setup) {
-                                video_sender.send_flv_video(message);
-                            }
-                            if (audio_setup) {
-                                audio_sender.send_flv_aac(message);
+                            if (message.type_id == 8 || message.type_id == 9) {
+                                pending_messages.push_back(message);
                             }
                         }
                     }
-                    last_playback_timestamp_ms.reset();
-                    next_due_time.reset();
-                    live_buffer_started_at.reset();
-                    live_playback_started = false;
                     callback_id = next_callback_id_.fetch_add(1);
                     registry_.add_live_callback_subscriber(stream_key, callback_id, [&](const otts::rtmp::MediaMessage& message) {
                         {
@@ -776,6 +794,7 @@ void RtspPlayServer::handle_client(int client_fd) {
                         queue_cv.notify_one();
                     });
                     subscribed = true;
+                    queue_cv.notify_all();
                     registry_.upsert_external_session(
                         session_key,
                         stream_key,

@@ -58,7 +58,7 @@ set -euo pipefail
 
 sudo apt update
 sudo apt install -y \
-  ffmpeg curl net-tools iproute2 psmisc nodejs npm \
+  ffmpeg curl openssl net-tools iproute2 psmisc nodejs npm \
   libssl3 libsrt1.5-openssl libnice10 libsrtp2-1 libusrsctp2
 EOF
 

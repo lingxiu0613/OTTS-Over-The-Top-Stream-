@@ -1,4 +1,5 @@
 import express from "express";
+import { spawnSync } from "child_process";
 import fs from "fs/promises";
 import http from "http";
 import https from "https";
@@ -1217,6 +1218,24 @@ if (!nativeProtocolOnly && rtspPlaybackEnabled) {
 
 if (tlsKeyPath && tlsCertPath) {
   try {
+    try {
+      await Promise.all([fs.access(tlsKeyPath), fs.access(tlsCertPath)]);
+    } catch {
+      await fs.mkdir(path.dirname(tlsKeyPath), { recursive: true });
+      await fs.mkdir(path.dirname(tlsCertPath), { recursive: true });
+      const result = spawnSync("openssl", [
+        "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+        "-keyout", tlsKeyPath,
+        "-out", tlsCertPath,
+        "-days", "3650",
+        "-subj", "/CN=OTTS Development"
+      ], { encoding: "utf8" });
+      if (result.status !== 0) {
+        throw new Error(`failed to generate development TLS certificate: ${result.stderr || "openssl failed"}`);
+      }
+      await fs.chmod(tlsKeyPath, 0o600);
+      console.log("OTTS generated a local self-signed HTTPS certificate.");
+    }
     const [key, cert] = await Promise.all([
       fs.readFile(tlsKeyPath),
       fs.readFile(tlsCertPath)

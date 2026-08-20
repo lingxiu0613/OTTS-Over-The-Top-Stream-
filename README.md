@@ -1,381 +1,232 @@
-# OTTS
+# OTTS (Over-The-Top Stream)
 
-OTTS, short for `Over-The-Top Stream`, is an open-source streaming server project for Ubuntu deployments.
+OTTS is an open-source streaming server for Ubuntu. It uses a C++20 media core,
+a Node.js control plane and web console, and Python for smoke tests and optional
+compatibility tooling.
 
-Current phase focus:
+The current development snapshot has been validated with H.264 video and AAC
+audio across RTMP, HTTP-FLV, HLS, RTSP, and SRT. Native WHIP/WHEP uses H.264
+video and Opus audio through libdatachannel.
 
-- `C++` media core
-- `Node.js` control plane and web console
-- `Python` WebRTC gateway and test tooling
+## Current Status
 
-The current stable phase already covers:
+| Protocol | Publish | Play | Current path |
+| --- | --- | --- | --- |
+| RTMP | Yes | Yes | Native C++ |
+| HTTP-FLV | - | Yes | Native C++ remux |
+| HLS | - | Yes | Node-managed FFmpeg segmenter |
+| WHIP | Yes | - | Native C++ / libdatachannel |
+| WHEP | - | Yes | Native C++ / libdatachannel |
+| RTSP | Yes | Yes | Native C++ RTP ingest and egress |
+| SRT | Yes | Yes | Native C++ libsrt + MPEG-TS |
 
-- RTMP publish/play
-- HTTP-FLV playback
-- HLS output
-- WHIP/WHEP compatibility access
-- RTSP publish/play compatibility
-- SRT publish/play compatibility
-- live stream status APIs
-- browser management console
+Implemented runtime features include:
+
+- unified stream registry, tracks, packet statistics, GOP cache, and fanout;
+- H.264/AAC sequence-header caching and late-subscriber startup;
+- stream health, session, disconnect, and Prometheus-style metrics APIs;
+- SRS-compatible WHIP/WHEP HTTP endpoints;
+- RTSP H.264/AAC RTP over UDP publish and UDP/TCP-interleaved play;
+- SRT listener-mode ingest and egress;
+- HTTP-FLV slow-client protection and connection statistics;
+- HLS readiness, master playlist, restart, and cleanup management;
+- FLV/MP4 recording lifecycle;
+- token and HMAC-signed stream authorization;
+- browser dashboard and WHIP/WHEP test page.
 
 ## Architecture
 
-OTTS is split into three layers:
-
-- `cpp/`: media core, RTMP server, HTTP API, stream registry
-- `node/`: control plane, dashboard, HLS/RTSP/SRT worker orchestration
-- `python/`: WebRTC gateway, smoke tools, helper utilities
-
-Current design principle:
-
-- C++ handles the media data plane
-- Node.js handles control plane and web UI
-- Python handles WebRTC gateway and automation helpers
-
-## Repository Layout
-
-- `cpp/`: C++ core implementation
-- `node/`: Express-based control plane and web UI
-- `python/`: WebRTC gateway and helper scripts
-- `scripts/`: operational scripts for restart, status, stop, smoke tests
-- `docs/`: notes and staged design documents
-
-## Production Configuration
-
-Runtime production config lives in `config/otts.config.json`; start from `config/otts.config.json.example`.
-It covers vhost/app/stream policy, protocol ports, auth, recording, HLS, logging, and HTTP callback hooks.
-See `docs/config-and-callbacks.md` for hot reload rules and callback payloads.
-
-## Stable Features In This Version
-
-- RTMP ingest from OBS / FFmpeg
-- RTMP playback from ffplay and compatible clients
-- H.264 + AAC passthrough
-- GOP cache and metadata / sequence-header caching
-- HTTP-FLV playback for browser and player testing
-- HLS playlist generation
-- SRS-style WHIP/WHEP compatibility URLs
-- RTSP publish/play compatibility endpoints
-- SRT publish/play compatibility endpoints
-- C++ health, stream list, disconnect, and session APIs
-- Node dashboard for stream visibility and protocol debugging
-
-## Not Yet Native In C++ Core
-
-These protocol paths are currently stable, but still rely on bridge workers outside the pure C++ media path:
-
-- WHIP/WHEP media bridging
-- RTSP compatibility media bridging
-- SRT compatibility media bridging
-- HLS segment generation
-
-That is acceptable for the current phase-1/phase-2 stable milestone.
-
-## Environment
-
-Recommended OS:
-
-- Ubuntu 22.04 or compatible Ubuntu environment
-
-Recommended runtime dependencies:
-
-- `build-essential`
-- `cmake`
-- `ffmpeg`
-- `python3`
-- `python3-aiohttp`
-- `python3-aiortc`
-- `python3-av`
-- `nodejs`
-- `npm`
-
-## Build Dependencies
-
-Install once on Ubuntu:
-
-```bash
-sudo apt-get update
-sudo apt-get install -y \
-  build-essential \
-  cmake \
-  ffmpeg \
-  python3 \
-  python3-aiohttp \
-  python3-aiortc \
-  python3-av \
-  nodejs \
-  npm
+```text
+Publish clients
+  RTMP / WHIP / RTSP / SRT
+              |
+              v
+      C++ protocol adapters
+              |
+              v
+   StreamRegistry + MediaPacket
+     tracks / GOP / fanout / stats
+              |
+              v
+Play clients
+  RTMP / HTTP-FLV / WHEP / RTSP / SRT
+              |
+              +--> Node control plane: dashboard, HLS, recording, callbacks
+              +--> Python: smoke tests and optional WebRTC fallback tooling
 ```
 
-Install Node dependencies once:
+Runtime ownership:
+
+- `cpp/`: C++20 media data plane and HTTP API;
+- `node/`: Express control plane, dashboard, HLS, and recording workers;
+- `python/`: automated tests and optional compatibility gateway;
+- `scripts/`: build-independent operations and regression tests;
+- `config/`: runtime environment and JSON configuration examples.
+
+The main C++ executable supervises the Node control plane. With the native
+libdatachannel build used by the current stable environment, Python is not in
+the live WHIP/WHEP media path.
+
+## Validated Platform
+
+The current server has been built and tested on:
+
+- Ubuntu 24.04.4 LTS x86_64;
+- GCC with C++20;
+- CMake 3.20 or newer;
+- FFmpeg/ffplay;
+- libsrt 1.5.3;
+- OpenSSL 3.0;
+- libnice 0.1.21;
+- libsrtp2 2.5;
+- libusrsctp;
+- Node.js and npm.
+
+Ubuntu 22.04 may also work, but some package names and versions differ.
+
+## Install Build Dependencies
 
 ```bash
-cd /home/nolovr/Downloads/otts/node
-npm install
+sudo apt update
+sudo apt install -y \
+  build-essential cmake pkg-config git \
+  ffmpeg curl openssl psmisc iproute2 \
+  nodejs npm python3 \
+  libssl-dev libsrt-openssl-dev \
+  libnice-dev libsrtp2-dev libusrsctp-dev
 ```
+
+Install the Node dependency:
+
+```bash
+cd node
+npm ci
+cd ..
+```
+
+Python packages such as `aiohttp`, `aiortc`, and `av` are only required by
+the optional Python WebRTC gateway and related test tools.
 
 ## Build
 
+### Native RTMP, HTTP-FLV, RTSP, and SRT
+
 ```bash
-cd /home/nolovr/Downloads/otts
 cmake -S . -B build
-cmake --build build -j
+cmake --build build -j"$(nproc)"
 ```
 
-Main executable:
+### Native WHIP/WHEP
+
+Build and install libdatachannel under the ignored `third_party/` directory:
 
 ```bash
-/home/nolovr/Downloads/otts/build/otts_rtmp
+git clone --recursive \
+  https://github.com/paullouisageneau/libdatachannel.git \
+  third_party/libdatachannel-src
+
+cmake -S third_party/libdatachannel-src \
+  -B third_party/libdatachannel-build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DUSE_NICE=ON \
+  -DNO_EXAMPLES=ON \
+  -DNO_TESTS=ON \
+  -DCMAKE_INSTALL_PREFIX="$PWD/third_party/libdatachannel-install"
+
+cmake --build third_party/libdatachannel-build \
+  --target install -j"$(nproc)"
 ```
 
-## Run
-
-The OTTS executable is the single launcher entry for the current version. It starts:
-
-- C++ RTMP core
-- Node.js control plane
-- Python WebRTC gateway
-
-Recommended start command:
+Configure OTTS with the native backend:
 
 ```bash
-cd /home/nolovr/Downloads/otts
-bash scripts/restart_otts.sh
+cmake -S . -B build \
+  -DOTTS_ENABLE_WEBRTC_DATACHANNEL=ON \
+  -DOTTS_LIBDATACHANNEL_ROOT="$PWD/third_party/libdatachannel-install"
+
+cmake --build build -j"$(nproc)"
 ```
 
-Direct start is also possible:
+The resulting executable is:
 
-```bash
-cd /home/nolovr/Downloads/otts
-./build/otts_rtmp
+```text
+build/otts_rtmp
 ```
 
-But for day-to-day use, `restart_otts.sh` is preferred because it first clears old processes and occupied ports.
+## Configure
 
-## Stream Token Authentication
-
-By default, OTTS keeps the local development behavior open and does not require a stream token.
-Set `OTTS_STREAM_TOKEN` before starting the core to require the same `token` query parameter on RTMP publish/play, HTTP-FLV playback, and WHIP/WHEP publish/play requests.
-
-Example:
-
-```bash
-export OTTS_STREAM_TOKEN=change-me
-bash scripts/restart_otts.sh
-```
-
-Authenticated URLs:
-
-```bash
-rtmp://192.168.40.11:1935/live/nolo001?token=change-me
-http://192.168.40.11:8080/live/nolo001.flv?token=change-me
-http://192.168.40.11:1985/rtc/v1/whip/?app=live&stream=livestream&token=change-me
-http://192.168.40.11:1985/rtc/v1/whep/?app=live&stream=livestream&token=change-me
-```
-
-HLS compatibility workers enter the core through managed RTMP loopback paths and automatically carry the token internally.
-RTSP edge listeners require `token` in the RTSP URL when `OTTS_STREAM_TOKEN` is set.
-SRT edge listeners use libsrt connection encryption as edge auth: when `OTTS_STREAM_TOKEN` is 10-79 characters, clients must add `passphrase=<token>&pbkeylen=16`.
-
-RTSP/SRT examples with authentication enabled:
-
-```bash
-ffmpeg -re -i news_1280x720.mp4 -rtsp_transport udp -vcodec h264 -f rtsp "rtsp://192.168.40.11:8554/live__rtsp-compat.sdp?token=change-me"
-ffplay "rtsp://192.168.40.11:8556/live__rtsp-compat.sdp?token=change-me"
-
-ffmpeg -re -i news_1280x720.mp4 -c copy -f mpegts "srt://192.168.40.11:9000?mode=caller&transtype=live&passphrase=change-me-10&pbkeylen=16"
-ffplay "srt://192.168.40.11:10000?mode=caller&transtype=live&passphrase=change-me-10&pbkeylen=16"
-```
-
-## Stream Key Signed URLs
-
-`OTTS_STREAM_TOKEN` remains supported as a simple global token. For stream-key level permission, set `OTTS_AUTH_SECRET`; clients may then use signed URLs with `expires` and `sign`. The signature is HMAC-SHA256 over `action + "\n" + stream_key + "\n" + expires`, where action is `publish` or `play`.
-
-Generate signed test URLs on the server:
-
-```bash
-export OTTS_AUTH_SECRET=change-this-secret
-python3 scripts/sign_stream_url.py live/nolo001 --ttl 3600 --host 192.168.40.11
-```
-
-A publish signature cannot be reused for play, and an expired signature is rejected by RTMP, HTTP-FLV, WHIP/WHEP, and RTSP edge entry points.
-
-## Configuration File
-
-Runtime settings can be centralized in `config/otts.env`. Start from the example file:
+Create local runtime files from the tracked examples:
 
 ```bash
 cp config/otts.env.example config/otts.env
-vim config/otts.env
+cp config/otts.config.json.example config/otts.config.json
+```
+
+Edit at least these values for the deployment host:
+
+```bash
+OTTS_PUBLIC_HOST=192.168.40.11
+OTTS_RTSP_PUBLIC_HOST=192.168.40.11
+OTTS_SRT_PUBLIC_HOST=192.168.40.11
+```
+
+The local files `config/otts.env` and `config/otts.config.json` are ignored by
+Git. Shell environment variables override values loaded from
+`config/otts.env`.
+
+Detailed vhost, callback, recording, HLS, and hot-reload behavior is documented
+in `docs/config-and-callbacks.md`.
+
+## Start And Stop
+
+Use the operational scripts for normal development:
+
+```bash
 bash scripts/restart_otts.sh
-```
-
-Shell environment variables still have priority over values in `config/otts.env`, so temporary overrides work as expected:
-
-```bash
-OTTS_AUTH_SECRET=test-secret bash scripts/restart_otts.sh
-```
-
-The shared loader is `scripts/otts_env.sh`; `restart_otts.sh`, `stop_otts.sh`, `status_otts.sh`, and `scripts/sign_stream_url.py` use the same configuration defaults.
-
-## Operations
-
-Restart OTTS cleanly:
-
-```bash
-cd /home/nolovr/Downloads/otts
-bash scripts/restart_otts.sh
-```
-
-Check current status:
-
-```bash
-cd /home/nolovr/Downloads/otts
 bash scripts/status_otts.sh
+bash scripts/stop_otts.sh
 ```
 
-Stop all OTTS-related processes:
+`restart_otts.sh` performs dependency/port checks, stops the previous OTTS
+process tree, launches the latest `build/otts_rtmp`, and prints health,
+streams, sessions, listeners, and recent logs.
+
+Direct foreground start is useful for debugging:
 
 ```bash
-cd /home/nolovr/Downloads/otts
-bash scripts/stop_otts.sh
+./build/otts_rtmp
 ```
 
 ## Default Ports
 
-- RTMP: `1935`
-- C++ HTTP API / HTTP-FLV: `8080`
-- WHIP/WHEP compatibility HTTP: `1985`
-- Python WebRTC gateway: `8081`
-- Node HTTP console: `3000`
-- Node HTTPS console: `3443`
-- RTSP publish: `8554`
-- RTSP play: `8556`
-- SRT publish: `9000`
-- SRT play: `10000`
+| Port | Transport | Service |
+| --- | --- | --- |
+| 1935 | TCP | RTMP |
+| 1985 | TCP | WHIP/WHEP compatibility HTTP |
+| 3000 | TCP | Node HTTP dashboard |
+| 3443 | TCP | Node HTTPS dashboard |
+| 8080 | TCP | C++ API and HTTP-FLV |
+| 8081 | TCP | Optional Python WebRTC fallback |
+| 8554 | TCP + dynamic UDP | RTSP publish |
+| 8556 | TCP + dynamic UDP | RTSP play |
+| 9000 | UDP | SRT publish |
+| 10000 | UDP | SRT play |
 
-## Web Console
+Open firewall access for the ports and transports used by your clients. RTSP
+over UDP also negotiates dynamic RTP/RTCP UDP ports.
 
-Open:
+## Protocol Verification
 
-- `http://127.0.0.1:3000`
-- `https://127.0.0.1:3443`
-
-The dashboard includes:
-
-- live stream list
-- protocol session views
-- HLS status
-- RTSP compatibility status
-- SRT status
-- WHIP/WHEP test page
-- playback URL references
-
-## Core HTTP APIs
-
-Health:
-
-```bash
-curl http://127.0.0.1:8080/api/health
-```
-
-Current streams:
-
-```bash
-curl http://127.0.0.1:8080/api/streams
-```
-
-Current protocol sessions:
-
-```bash
-curl http://127.0.0.1:8080/api/sessions
-```
-
-Disconnect a stream:
-
-```bash
-curl -X POST "http://127.0.0.1:8080/api/streams/disconnect?stream_key=live/demo"
-```
-
-SRT session status:
-
-```bash
-curl http://127.0.0.1:3000/api/srt/sessions
-```
-
-## Recording
-
-Recordings are managed by the Node control plane and saved under `/tmp/otts_recordings` by default.
-The first implementation records from the RTMP core and supports `flv` and `mp4` outputs.
-
-Start recording:
-
-```bash
-curl -X POST "http://127.0.0.1:3000/api/recordings/start?stream_key=live/demo&format=flv"
-curl -X POST "http://127.0.0.1:3000/api/recordings/start?stream_key=live/demo&format=mp4"
-```
-
-Stop recording:
-
-```bash
-curl -X POST "http://127.0.0.1:3000/api/recordings/stop?stream_key=live/demo"
-```
-
-List recording files:
-
-```bash
-curl http://127.0.0.1:3000/api/recordings
-```
-
-## Metrics And Log Level
-
-The C++ core exposes Prometheus-style metrics on the HTTP API port. Use this for dashboards, alerts, or quick runtime checks:
-
-```bash
-curl http://127.0.0.1:8080/metrics
-curl http://127.0.0.1:8080/api/metrics
-```
-
-Useful metrics include current stream count, publisher state, per-stream packets/bytes/viewers, protocol sessions, and HTTP-FLV connection counters.
-
-Set the core log threshold with `OTTS_LOG_LEVEL` in `config/otts.env` or the shell environment:
-
-```bash
-OTTS_LOG_LEVEL=debug|info|warn|error
-```
-
-## Preflight And Smoke Tests
-
-Run dependency and port checks before troubleshooting a failed start:
-
-```bash
-scripts/preflight_otts.sh
-scripts/preflight_otts.sh --strict
-```
-
-Run smoke tests with the current `config/otts.env` settings. The scripts automatically use configured ports and add token/signature auth when `OTTS_STREAM_TOKEN` or `OTTS_AUTH_SECRET` is enabled:
-
-```bash
-scripts/smoke_rtmp.sh live/rtmp-smoke
-scripts/smoke_rtsp.sh /path/to/news_1280x720.mp4 live/rtsp-smoke
-scripts/smoke_srt.sh /path/to/news_1280x720.mp4 live/srt-smoke
-scripts/smoke_all.sh /path/to/news_1280x720.mp4
-scripts/smoke_cpp_rtsp_play.sh /path/to/news_1280x720.mp4 live/cpp-rtsp-smoke
-```
-
-Smoke tests create their own test streams but do not stop unrelated user streams that are already running.
-
-## Protocol Test Matrix
-
-The following commands are the validated compatibility tests for the current stable version.
+Replace `192.168.40.11` and the media filename as needed.
 
 ### RTMP
 
-Push:
+Publish:
 
 ```bash
-ffmpeg -re -i news_1280x720.mp4 -c copy -f flv rtmp://192.168.40.11:1935/live/nolo001
+ffmpeg -re -i news_1280x720.mp4 \
+  -c copy -f flv \
+  rtmp://192.168.40.11:1935/live/nolo001
 ```
 
 Play:
@@ -384,24 +235,15 @@ Play:
 ffplay rtmp://192.168.40.11:1935/live/nolo001
 ```
 
-Local smoke test:
-
-```bash
-cd /home/nolovr/Downloads/otts
-bash scripts/smoke_rtmp.sh
-```
-
 ### HTTP-FLV
 
-Play URL example:
-
-```text
-http://192.168.40.11:8080/live/nolo001.flv
+```bash
+ffplay http://192.168.40.11:8080/live/nolo001.flv
 ```
 
-### HLS
+Browser playback is provided by the dashboard using flv.js.
 
-Playlist URL examples:
+### HLS
 
 ```text
 http://192.168.40.11:3000/hls/live__nolo001/index.m3u8
@@ -410,30 +252,42 @@ http://192.168.40.11:3000/hls/live__nolo001/master.m3u8
 
 ### WHIP / WHEP
 
-Validated compatibility URLs:
+WHIP publish URL:
 
-- WHIP publish:
-  `http://192.168.40.11:1985/rtc/v1/whip/?app=live&stream=livestream`
-- WHEP play:
-  `http://192.168.40.11:1985/rtc/v1/whep/?app=live&stream=livestream`
+```text
+http://192.168.40.11:1985/rtc/v1/whip/?app=live&stream=livestream
+```
 
-Web test page:
+WHEP play URL:
+
+```text
+http://192.168.40.11:1985/rtc/v1/whep/?app=live&stream=livestream
+```
+
+The first URL can be used by OBS WHIP output. The browser test page is:
 
 ```text
 https://192.168.40.11:3443/webrtc.html
 ```
 
+When the configured certificate files do not exist, the Node control plane
+uses OpenSSL to generate a local self-signed development certificate. The key
+is ignored by Git. A browser warning is expected until a trusted certificate is
+configured.
+
 ### RTSP
-RTSP push defaults to `core-direct-flv`: Node keeps the RTSP control/RTP listener and ffmpeg RTP/FLV demux helper, then streams FLV bytes over one long-lived C++ `/api/internal/media/publish/flv-stream` connection. The C++ core parses FLV tags and injects packets into the unified `StreamRegistry`. Set `OTTS_RTSP_PUBLISH_MODE=legacy-rtmp-loopback` to force the older RTMP bridge path.
-C++ native RTSP play owns `OTTS_RTSP_PLAY_PORT=8556` by default and can be tested with `rtsp://192.168.40.11:8556/live__stream.sdp`. It supports H.264 video and AAC audio over RTP/UDP from the C++ `StreamRegistry`.
 
-RTSP play is C++ native on port `8556`: the C++ core handles RTSP control, RTP/UDP, RTP/TCP interleaved, H.264 video, and AAC audio directly from the shared `StreamRegistry`. The older Node/ffmpeg RTSP playback compatibility listener is disabled by `OTTS_RTSP_PLAY_COMPAT_ENABLED=false`.
+The native RTSP path currently supports H.264 video and AAC audio. Publish to
+port 8554 and play from port 8556. A stream key containing `/` is represented
+as `__` in the RTSP path.
 
-
-Push:
+Publish:
 
 ```bash
-ffmpeg -re -i news_1280x720.mp4 -rtsp_transport udp -vcodec h264 -f rtsp rtsp://192.168.40.11:8554/live__rtsp-compat.sdp
+ffmpeg -re -stream_loop -1 -i 1.mkv \
+  -rtsp_transport udp \
+  -c:v copy -c:a copy -f rtsp \
+  rtsp://192.168.40.11:8554/live__rtsp-compat.sdp
 ```
 
 Play:
@@ -442,21 +296,18 @@ Play:
 ffplay rtsp://192.168.40.11:8556/live__rtsp-compat.sdp
 ```
 
-Local smoke test:
-
-```bash
-cd /home/nolovr/Downloads/otts
-bash scripts/smoke_rtsp.sh news_1280x720.mp4
-```
+The RTSP implementation parses AAC SDP and RFC 3640 AU headers, publishes audio
+and video into the shared registry, reorders both tracks on one media clock,
+and paces cached/live RTP output to avoid burst loss and slow-motion playback.
 
 ### SRT
-SRT ingest defaults to `core-direct-flv`: Node keeps the SRT listener and ffmpeg MPEG-TS/FLV demux helper, then streams FLV bytes over one long-lived C++ `/api/internal/media/publish/flv-stream` connection. The C++ core parses FLV tags and injects packets into the unified `StreamRegistry` without RTMP loopback. Set `OTTS_SRT_PUBLISH_MODE=legacy-rtmp-loopback` to force the older RTMP bridge path.
 
-
-Push:
+Publish MPEG-TS:
 
 ```bash
-ffmpeg -re -i news_1280x720.mp4 -c copy -f mpegts "srt://192.168.40.11:9000?mode=caller&transtype=live"
+ffmpeg -re -i news_1280x720.mp4 \
+  -c copy -f mpegts \
+  "srt://192.168.40.11:9000?mode=caller&transtype=live"
 ```
 
 Play:
@@ -465,71 +316,122 @@ Play:
 ffplay "srt://192.168.40.11:10000?mode=caller&transtype=live"
 ```
 
-Local smoke test:
+The default listener pair maps to `live/srt-demo`.
 
-```bash
-cd /home/nolovr/Downloads/otts
-bash scripts/smoke_srt.sh news_1280x720.mp4
+## Web Console And APIs
+
+Dashboard:
+
+```text
+http://192.168.40.11:3000/
+https://192.168.40.11:3443/
 ```
 
-OTTS bootstraps the default `live/srt-demo` SRT listener pair on startup, so the default `9000/10000` endpoints are available immediately after service start.
+Core endpoints:
 
-## Testing Recommendation
+```bash
+curl http://127.0.0.1:8080/api/health
+curl http://127.0.0.1:8080/api/streams
+curl http://127.0.0.1:8080/api/sessions
+curl http://127.0.0.1:8080/metrics
+```
 
-Recommended validation order:
+Disconnect a stream:
 
-1. Run `bash scripts/restart_otts.sh`
-2. Check `bash scripts/status_otts.sh`
-3. Verify RTMP
-4. Verify HTTP-FLV
-5. Verify HLS
-6. Verify WHIP/WHEP
-7. Verify RTSP
-8. Verify SRT
+```bash
+curl -X POST \
+  "http://127.0.0.1:8080/api/streams/disconnect?stream_key=live/demo"
+```
 
-If you need a quick sanity check before external testing:
+The stream API reports publisher state, codecs, packet/byte rates, viewers,
+sequence headers, keyframes, GOP cache, and HTTP-FLV counters.
 
-- `bash scripts/smoke_rtmp.sh`
-- `bash scripts/smoke_rtsp.sh news_1280x720.mp4`
-- `bash scripts/smoke_srt.sh news_1280x720.mp4`
+## Recording
+
+```bash
+curl -X POST \
+  "http://127.0.0.1:3000/api/recordings/start?stream_key=live/demo&format=mp4"
+
+curl -X POST \
+  "http://127.0.0.1:3000/api/recordings/stop?stream_key=live/demo"
+
+curl http://127.0.0.1:3000/api/recordings
+```
+
+The default recording directory is `/tmp/otts_recordings`.
+
+## Authentication
+
+Open development mode is the default. To require a shared token, set
+`OTTS_STREAM_TOKEN` in `config/otts.env` and restart OTTS.
+
+For per-action signed URLs, set `OTTS_AUTH_SECRET` and generate a URL with:
+
+```bash
+python3 scripts/sign_stream_url.py \
+  live/nolo001 --ttl 3600 --host 192.168.40.11
+```
+
+Publish and play signatures are different and cannot be reused. RTSP accepts
+the token/signature in the URL query. SRT uses its passphrase and `pbkeylen`
+parameters when edge encryption is enabled.
+
+## Smoke And Regression Tests
+
+Preflight:
+
+```bash
+bash scripts/preflight_otts.sh
+bash scripts/preflight_otts.sh --strict
+```
+
+Individual protocol tests:
+
+```bash
+bash scripts/smoke_rtmp.sh live/rtmp-smoke
+bash scripts/smoke_rtsp.sh /path/to/input.mp4 live/rtsp-smoke
+bash scripts/smoke_srt.sh /path/to/input.mp4 live/srt-smoke
+bash scripts/smoke_hls.sh live/hls-smoke
+```
+
+Full suite:
+
+```bash
+bash scripts/smoke_all.sh /path/to/input.mp4
+```
+
+Smoke scripts use isolated test stream keys and do not intentionally stop
+unrelated user streams.
 
 ## Runtime Files
 
-Runtime state file:
+Common diagnostics:
 
 ```text
-/tmp/otts_state.json
-```
-
-Managed child process logs:
-
-```text
+/tmp/otts_core.pid
 /tmp/otts_clean2.out
 /tmp/otts_clean2.err
 /tmp/otts_node.out
 /tmp/otts_node.err
-/tmp/otts_webrtc.out
-/tmp/otts_webrtc.err
+/tmp/otts_state.json
 ```
 
-## Current Milestone Summary
+Build directories, local configuration, test media, archives, logs,
+`node_modules`, and `third_party/` are ignored by Git.
 
-This version is suitable as a stable pre-commit milestone for:
+## Current Limits
 
-- RTMP
-- HTTP-FLV
-- HLS
-- WHIP/WHEP compatibility access
-- RTSP compatibility access
-- SRT compatibility access
+- Media processing is remux/passthrough; OTTS is not a transcoding server.
+- The primary tested video/audio combination is H.264 + AAC.
+- Native WHIP/WHEP uses browser/OBS-compatible H.264 + Opus.
+- H.265, cluster forwarding, replay, and production certificate automation are
+  planned rather than complete.
+- HLS and recording still use managed FFmpeg workers.
+- The current default SRT listener pair represents one predefined stream.
 
-## Next Planned Work
+## License And Contributions
 
-1. Promote the C++ RTSP play path toward the default `8556` endpoint after longer soak tests.
-2. Add RTSP interleaved TCP/RTCP handling, then move RTSP publish control/RTP handling from Node into C++.
-3. Move SRT socket handling from Node/ffmpeg into the C++ core when a libsrt integration is added.
-4. Keep reducing ffmpeg helper usage toward protocol-native packetization.
-5. Bridge WHIP/WHEP media path into the unified C++ stream model.
-6. Add management authentication, H.265, snapshots, replay, and multi-node forwarding.
-
-SRT play defaults to `core-egress-flv`: ffmpeg reads the C++ HTTP-FLV output and remuxes it to the SRT MPEG-TS listener. Set `OTTS_SRT_PLAY_MODE=legacy-rtmp-loopback` to force the older RTMP pull path.
+Before publishing a public release, add the intended open-source `LICENSE`
+file and verify third-party license obligations for bundled binaries and
+release archives. Issues and pull requests should include reproduction
+commands, OTTS logs, client versions, and the relevant stream API snapshot.

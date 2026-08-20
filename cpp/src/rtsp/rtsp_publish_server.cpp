@@ -240,6 +240,129 @@ struct NalSets {
     std::vector<std::uint8_t> pps;
 };
 
+struct AacSdpConfig {
+    bool present{false};
+    std::uint8_t payload_type{97};
+    std::uint32_t sample_rate{44100};
+    std::uint8_t channels{2};
+    std::vector<std::uint8_t> audio_specific_config;
+};
+
+int hex_digit(char ch) {
+    if (ch >= '0' && ch <= '9') {
+        return ch - '0';
+    }
+    ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    if (ch >= 'a' && ch <= 'f') {
+        return 10 + ch - 'a';
+    }
+    return -1;
+}
+
+std::vector<std::uint8_t> hex_decode(std::string value) {
+    value = trim(std::move(value));
+    if ((value.size() % 2) != 0) {
+        return {};
+    }
+    std::vector<std::uint8_t> out;
+    out.reserve(value.size() / 2);
+    for (std::size_t i = 0; i < value.size(); i += 2) {
+        const auto high = hex_digit(value[i]);
+        const auto low = hex_digit(value[i + 1]);
+        if (high < 0 || low < 0) {
+            return {};
+        }
+        out.push_back(static_cast<std::uint8_t>((high << 4) | low));
+    }
+    return out;
+}
+
+std::uint8_t aac_sample_rate_index(std::uint32_t sample_rate) {
+    static constexpr std::array<std::uint32_t, 13> rates{
+        96000, 88200, 64000, 48000, 44100, 32000, 24000,
+        22050, 16000, 12000, 11025, 8000, 7350};
+    for (std::uint8_t i = 0; i < rates.size(); ++i) {
+        if (rates[i] == sample_rate) {
+            return i;
+        }
+    }
+    return 4;
+}
+
+std::vector<std::uint8_t> make_aac_audio_specific_config(std::uint32_t sample_rate, std::uint8_t channels) {
+    constexpr std::uint8_t object_type = 2;
+    const auto rate_index = aac_sample_rate_index(sample_rate);
+    return {
+        static_cast<std::uint8_t>((object_type << 3) | (rate_index >> 1)),
+        static_cast<std::uint8_t>(((rate_index & 0x01) << 7) | ((channels & 0x0f) << 3))};
+}
+
+AacSdpConfig parse_sdp_aac(const std::string& sdp) {
+    AacSdpConfig config;
+    std::istringstream lines(sdp);
+    std::string line;
+    bool in_audio_section = false;
+    while (std::getline(lines, line)) {
+        line = trim(std::move(line));
+        if (line.rfind("m=", 0) == 0) {
+            in_audio_section = line.rfind("m=audio ", 0) == 0;
+            if (in_audio_section) {
+                std::istringstream media(line.substr(2));
+                std::string kind;
+                std::string port;
+                std::string protocol;
+                unsigned payload_type = 97;
+                media >> kind >> port >> protocol >> payload_type;
+                if (payload_type <= 127) {
+                    config.payload_type = static_cast<std::uint8_t>(payload_type);
+                }
+            }
+            continue;
+        }
+        if (!in_audio_section) {
+            continue;
+        }
+        const auto rtpmap_prefix = std::string("a=rtpmap:") + std::to_string(config.payload_type) + " ";
+        if (line.rfind(rtpmap_prefix, 0) == 0) {
+            const auto encoding = line.substr(rtpmap_prefix.size());
+            const auto encoding_lower = lower(encoding);
+            if (encoding_lower.rfind("mpeg4-generic/", 0) != 0) {
+                continue;
+            }
+            std::istringstream values(encoding.substr(std::string("MPEG4-GENERIC/").size()));
+            std::string rate;
+            std::string channels;
+            std::getline(values, rate, '/');
+            std::getline(values, channels, '/');
+            try {
+                config.sample_rate = static_cast<std::uint32_t>(std::stoul(rate));
+                config.channels = channels.empty() ? 1 : static_cast<std::uint8_t>(std::stoul(channels));
+                config.present = config.sample_rate > 0 && config.channels > 0;
+            } catch (...) {
+                config.present = false;
+            }
+            continue;
+        }
+        const auto fmtp_prefix = std::string("a=fmtp:") + std::to_string(config.payload_type) + " ";
+        if (line.rfind(fmtp_prefix, 0) == 0) {
+            auto parameters = line.substr(fmtp_prefix.size());
+            const auto config_pos = lower(parameters).find("config=");
+            if (config_pos != std::string::npos) {
+                auto value = parameters.substr(config_pos + 7);
+                const auto semicolon = value.find(';');
+                if (semicolon != std::string::npos) {
+                    value.resize(semicolon);
+                }
+                config.audio_specific_config = hex_decode(value);
+            }
+        }
+    }
+    if (config.present && config.audio_specific_config.empty()) {
+        config.audio_specific_config = make_aac_audio_specific_config(config.sample_rate, config.channels);
+    }
+    return config;
+}
+
 std::vector<std::uint8_t> base64_decode(const std::string& input) {
     static const std::string alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     std::array<int, 256> table{};
@@ -411,6 +534,129 @@ otts::rtmp::MediaMessage make_avc_nalu_message(
     message.payload.insert(message.payload.end(), avcc.begin(), avcc.end());
     return message;
 }
+
+otts::rtmp::MediaMessage make_aac_message(
+    std::uint32_t timestamp_ms,
+    std::uint8_t channels,
+    std::uint8_t packet_type,
+    const std::uint8_t* payload,
+    std::size_t payload_size) {
+    otts::rtmp::MediaMessage message;
+    message.timestamp = timestamp_ms;
+    message.type_id = 8;
+    message.message_stream_id = 1;
+    message.payload.reserve(payload_size + 2);
+    message.payload.push_back(static_cast<std::uint8_t>(channels == 1 ? 0xae : 0xaf));
+    message.payload.push_back(packet_type);
+    message.payload.insert(message.payload.end(), payload, payload + payload_size);
+    return message;
+}
+
+class AacRtpIngest {
+public:
+    AacRtpIngest(otts::rtmp::StreamRegistry& registry, std::string stream_key, AacSdpConfig config)
+        : registry_(registry), stream_key_(std::move(stream_key)), config_(std::move(config)) {}
+
+    void handle_packet(const std::uint8_t* packet, std::size_t size) {
+        if (!config_.present || size < 12 || (packet[0] >> 6) != 2) {
+            return;
+        }
+        const auto csrc_count = packet[0] & 0x0f;
+        std::size_t offset = 12 + static_cast<std::size_t>(csrc_count) * 4;
+        if (offset >= size) {
+            return;
+        }
+        if ((packet[0] & 0x10) != 0) {
+            if (offset + 4 > size) {
+                return;
+            }
+            const auto extension_size = static_cast<std::size_t>((packet[offset + 2] << 8) | packet[offset + 3]) * 4;
+            offset += 4 + extension_size;
+            if (offset >= size) {
+                return;
+            }
+        }
+        const std::size_t padding = (packet[0] & 0x20) != 0 ? packet[size - 1] : 0;
+        if (padding > size - offset) {
+            return;
+        }
+        const auto payload_size = size - offset - padding;
+        if (payload_size < 4) {
+            return;
+        }
+        const auto rtp_timestamp =
+            (static_cast<std::uint32_t>(packet[4]) << 24) |
+            (static_cast<std::uint32_t>(packet[5]) << 16) |
+            (static_cast<std::uint32_t>(packet[6]) << 8) |
+            static_cast<std::uint32_t>(packet[7]);
+        const auto* payload = packet + offset;
+        const auto au_headers_bits = static_cast<std::size_t>((payload[0] << 8) | payload[1]);
+        const auto au_headers_bytes = (au_headers_bits + 7) / 8;
+        if (au_headers_bits < 16 || 2 + au_headers_bytes > payload_size) {
+            return;
+        }
+
+        const auto au_count = au_headers_bits / 16;
+        std::size_t data_offset = 2 + au_headers_bytes;
+        for (std::size_t i = 0; i < au_count; ++i) {
+            const auto header_offset = 2 + i * 2;
+            if (header_offset + 2 > 2 + au_headers_bytes) {
+                break;
+            }
+            const auto au_header = static_cast<std::uint16_t>((payload[header_offset] << 8) | payload[header_offset + 1]);
+            const auto au_size = static_cast<std::size_t>(au_header >> 3);
+            if (au_size == 0 || data_offset + au_size > payload_size) {
+                break;
+            }
+            publish_sequence_header_once();
+            const auto sample_timestamp = rtp_timestamp + static_cast<std::uint32_t>(i * 1024);
+            const auto timestamp_ms = next_timestamp_ms(sample_timestamp);
+            registry_.publish_external_media(
+                stream_key_,
+                otts::media::StreamSource::Rtsp,
+                "cpp-rtsp-native-publish",
+                make_aac_message(timestamp_ms, config_.channels, 1, payload + data_offset, au_size));
+            data_offset += au_size;
+        }
+    }
+
+private:
+    void publish_sequence_header_once() {
+        if (sent_sequence_ || config_.audio_specific_config.empty()) {
+            return;
+        }
+        registry_.publish_external_media(
+            stream_key_,
+            otts::media::StreamSource::Rtsp,
+            "cpp-rtsp-native-publish",
+            make_aac_message(0, config_.channels, 0, config_.audio_specific_config.data(), config_.audio_specific_config.size()));
+        sent_sequence_ = true;
+    }
+
+    std::uint32_t next_timestamp_ms(std::uint32_t rtp_timestamp) {
+        if (!last_rtp_timestamp_.has_value()) {
+            last_rtp_timestamp_ = rtp_timestamp;
+            elapsed_samples_ = 0;
+            timestamp_ms_ = 0;
+            return 0;
+        }
+        const auto delta = rtp_timestamp - *last_rtp_timestamp_;
+        const auto max_reasonable_delta = std::max<std::uint32_t>(config_.sample_rate * 2, 1024);
+        const auto samples = delta > 0 && delta <= max_reasonable_delta ? delta : 1024;
+        elapsed_samples_ += samples;
+        *timestamp_ms_ = static_cast<std::uint32_t>((elapsed_samples_ * 1000) / config_.sample_rate);
+        last_rtp_timestamp_ = rtp_timestamp;
+        return *timestamp_ms_;
+    }
+
+    otts::rtmp::StreamRegistry& registry_;
+    std::string stream_key_;
+    AacSdpConfig config_;
+    std::optional<std::uint32_t> last_rtp_timestamp_;
+    std::optional<std::uint32_t> timestamp_ms_;
+    std::uint64_t elapsed_samples_{0};
+    bool sent_sequence_{false};
+};
 
 class H264RtpIngest {
 public:
@@ -613,6 +859,7 @@ void RtspPublishServer::handle_client(int client_fd) {
     std::string buffer;
     std::string stream_key;
     NalSets sets;
+    AacSdpConfig aac_config;
     std::uint16_t video_rtp_port = 0;
     std::uint16_t video_rtcp_port = 0;
     int video_rtp_fd = -1;
@@ -622,7 +869,8 @@ void RtspPublishServer::handle_client(int client_fd) {
     int audio_rtp_fd = -1;
     int audio_rtcp_fd = -1;
     std::atomic<bool> receiving{false};
-    std::thread receiver;
+    std::thread video_receiver;
+    std::thread audio_receiver;
 
     auto cleanup = [&]() {
         receiving.store(false);
@@ -646,8 +894,11 @@ void RtspPublishServer::handle_client(int client_fd) {
             ::close(audio_rtcp_fd);
             audio_rtcp_fd = -1;
         }
-        if (receiver.joinable()) {
-            receiver.join();
+        if (video_receiver.joinable()) {
+            video_receiver.join();
+        }
+        if (audio_receiver.joinable()) {
+            audio_receiver.join();
         }
         if (!stream_key.empty()) {
             registry_.remove_external_session(session_key);
@@ -704,7 +955,14 @@ void RtspPublishServer::handle_client(int client_fd) {
             }
             if (request->method == "ANNOUNCE") {
                 sets = parse_sdp_sets(request->body);
-                registry_.upsert_external_stream(stream_key, otts::media::StreamSource::Rtsp, "", "h264", "cpp-rtsp-native-publish", true);
+                aac_config = parse_sdp_aac(request->body);
+                registry_.upsert_external_stream(
+                    stream_key,
+                    otts::media::StreamSource::Rtsp,
+                    aac_config.present ? "aac" : "",
+                    "h264",
+                    "cpp-rtsp-native-publish",
+                    true);
                 registry_.upsert_external_session(
                     session_key,
                     stream_key,
@@ -716,9 +974,9 @@ void RtspPublishServer::handle_client(int client_fd) {
                     "rtsp://0.0.0.0:" + std::to_string(port_),
                     "stream-registry",
                     "rtsp/rtp/udp",
-                    "cxx-rtsp-h264-rtp-demux",
+                    aac_config.present ? "cxx-rtsp-h264-aac-rtp-demux" : "cxx-rtsp-h264-rtp-demux",
                     "native-cxx",
-                    "h264",
+                    aac_config.present ? "h264/aac" : "h264",
                     0,
                     now_epoch_ms(),
                     0,
@@ -785,9 +1043,9 @@ void RtspPublishServer::handle_client(int client_fd) {
                     "rtsp://0.0.0.0:" + std::to_string(port_),
                     "stream-registry",
                     "rtsp/rtp/udp",
-                    "cxx-rtsp-h264-rtp-demux",
+                    aac_config.present ? "cxx-rtsp-h264-aac-rtp-demux" : "cxx-rtsp-h264-rtp-demux",
                     "native-cxx",
-                    "h264",
+                    aac_config.present ? "h264/aac" : "h264",
                     0,
                     now_epoch_ms(),
                     0,
@@ -807,7 +1065,7 @@ void RtspPublishServer::handle_client(int client_fd) {
                     continue;
                 }
                 receiving.store(true);
-                receiver = std::thread([&, local_rtp_fd = video_rtp_fd]() {
+                video_receiver = std::thread([&, local_rtp_fd = video_rtp_fd]() {
                     H264RtpIngest ingest(registry_, stream_key, sets);
                     std::array<std::uint8_t, 2048> packet{};
                     while (receiving.load()) {
@@ -818,6 +1076,19 @@ void RtspPublishServer::handle_client(int client_fd) {
                         ingest.handle_packet(packet.data(), static_cast<std::size_t>(received));
                     }
                 });
+                if (audio_rtp_fd >= 0 && aac_config.present) {
+                    audio_receiver = std::thread([&, local_audio_rtp_fd = audio_rtp_fd]() {
+                        AacRtpIngest ingest(registry_, stream_key, aac_config);
+                        std::array<std::uint8_t, 2048> packet{};
+                        while (receiving.load()) {
+                            const auto received = ::recv(local_audio_rtp_fd, packet.data(), packet.size(), 0);
+                            if (received <= 0) {
+                                break;
+                            }
+                            ingest.handle_packet(packet.data(), static_cast<std::size_t>(received));
+                        }
+                    });
+                }
                 registry_.upsert_external_session(
                     session_key,
                     stream_key,
@@ -829,9 +1100,9 @@ void RtspPublishServer::handle_client(int client_fd) {
                     "rtsp://0.0.0.0:" + std::to_string(port_),
                     "stream-registry",
                     "rtsp/rtp/udp",
-                    "cxx-rtsp-h264-rtp-demux",
+                    aac_config.present ? "cxx-rtsp-h264-aac-rtp-demux" : "cxx-rtsp-h264-rtp-demux",
                     "native-cxx",
-                    "h264",
+                    aac_config.present ? "h264/aac" : "h264",
                     0,
                     now_epoch_ms(),
                     0,
