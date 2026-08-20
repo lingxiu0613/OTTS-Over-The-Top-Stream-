@@ -92,16 +92,26 @@ if (OTTS_ENABLE_WEBRTC_DATACHANNEL)
     endif()
     pkg_check_modules(LIBNICE REQUIRED nice)
     pkg_check_modules(LIBSRTP REQUIRED libsrtp2)
+    pkg_check_modules(AVCODEC REQUIRED libavcodec)
+    pkg_check_modules(AVUTIL REQUIRED libavutil)
+    pkg_check_modules(SWRESAMPLE REQUIRED libswresample)
     find_library(USRSCTP_LIBRARY NAMES usrsctp REQUIRED)
+    target_sources(otts_rtmp PRIVATE cpp/src/webrtc/audio_transcoder.cpp)
     target_compile_definitions(otts_rtmp PRIVATE OTTS_WEBRTC_DATACHANNEL=1)
     target_include_directories(otts_rtmp SYSTEM PRIVATE
         "${OTTS_LIBDATACHANNEL_INCLUDE_DIR}"
         ${LIBNICE_INCLUDE_DIRS}
-        ${LIBSRTP_INCLUDE_DIRS})
+        ${LIBSRTP_INCLUDE_DIRS}
+        ${AVCODEC_INCLUDE_DIRS}
+        ${AVUTIL_INCLUDE_DIRS}
+        ${SWRESAMPLE_INCLUDE_DIRS})
     target_link_libraries(otts_rtmp PRIVATE
         "${OTTS_LIBDATACHANNEL_LIBRARY}"
         ${LIBNICE_LIBRARIES}
         ${LIBSRTP_LIBRARIES}
+        ${AVCODEC_LIBRARIES}
+        ${AVUTIL_LIBRARIES}
+        ${SWRESAMPLE_LIBRARIES}
         "${USRSCTP_LIBRARY}"
         OpenSSL::SSL)
     message(STATUS "OTTS WebRTC datachannel backend enabled: ${OTTS_LIBDATACHANNEL_LIBRARY}")

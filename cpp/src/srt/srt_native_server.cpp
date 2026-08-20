@@ -36,6 +36,11 @@ std::uint64_t now_epoch_ms() {
             .count());
 }
 
+otts::rtmp::StreamRegistry::CallbackId next_callback_id() {
+    static std::atomic<otts::rtmp::StreamRegistry::CallbackId> next{1};
+    return next.fetch_add(1, std::memory_order_relaxed);
+}
+
 std::uint32_t read_be32(const std::uint8_t* data) {
     return (static_cast<std::uint32_t>(data[0]) << 24) |
            (static_cast<std::uint32_t>(data[1]) << 16) |
@@ -219,6 +224,47 @@ std::vector<std::uint8_t> flv_video_to_annexb(const otts::rtmp::MediaMessage& me
         out.insert(out.end(), {0x00, 0x00, 0x00, 0x01});
         out.insert(out.end(), message.payload.begin() + static_cast<std::ptrdiff_t>(cursor), message.payload.begin() + static_cast<std::ptrdiff_t>(cursor + size));
         cursor += size;
+    }
+    return out;
+}
+
+std::vector<std::uint8_t> flv_avc_config_to_annexb(const otts::rtmp::MediaMessage& message) {
+    std::vector<std::uint8_t> out;
+    if (message.type_id != 9 || message.payload.size() < 12 ||
+        (message.payload[0] & 0x0f) != 7 || message.payload[1] != 0) {
+        return out;
+    }
+
+    std::size_t cursor = 10;
+    const auto append_nalus = [&](std::size_t count, std::size_t& position) -> bool {
+        for (std::size_t i = 0; i < count; ++i) {
+            if (position + 2 > message.payload.size()) {
+                return false;
+            }
+            const auto size = static_cast<std::size_t>(
+                (static_cast<std::uint16_t>(message.payload[position]) << 8) |
+                message.payload[position + 1]);
+            position += 2;
+            if (size == 0 || position + size > message.payload.size()) {
+                return false;
+            }
+            out.insert(out.end(), {0x00, 0x00, 0x00, 0x01});
+            out.insert(
+                out.end(),
+                message.payload.begin() + static_cast<std::ptrdiff_t>(position),
+                message.payload.begin() + static_cast<std::ptrdiff_t>(position + size));
+            position += size;
+        }
+        return true;
+    };
+
+    const auto sps_count = static_cast<std::size_t>(message.payload[cursor++] & 0x1f);
+    if (!append_nalus(sps_count, cursor) || cursor >= message.payload.size()) {
+        return {};
+    }
+    const auto pps_count = static_cast<std::size_t>(message.payload[cursor++]);
+    if (!append_nalus(pps_count, cursor) || sps_count == 0 || pps_count == 0) {
+        return {};
     }
     return out;
 }
@@ -690,6 +736,81 @@ int make_listener(std::uint16_t port) {
     return sock;
 }
 
+std::string trim_copy(std::string value) {
+    if (const auto null_pos = value.find('\0'); null_pos != std::string::npos) {
+        value.resize(null_pos);
+    }
+    const auto first = value.find_first_not_of(" \t\r\n\0", 0);
+    if (first == std::string::npos) {
+        return {};
+    }
+    const auto last = value.find_last_not_of(" \t\r\n\0");
+    return value.substr(first, last - first + 1);
+}
+
+std::string normalize_stream_key(std::string value) {
+    value = trim_copy(std::move(value));
+    while (!value.empty() && value.front() == '/') {
+        value.erase(value.begin());
+    }
+    if (value.size() > 4 && value.substr(value.size() - 4) == ".sdp") {
+        value.resize(value.size() - 4);
+    }
+    const auto separator = value.find("__");
+    if (separator != std::string::npos && value.find('/') == std::string::npos) {
+        value.replace(separator, 2, "/");
+    }
+    return value;
+}
+
+std::string parse_stream_id(std::string stream_id) {
+    stream_id = trim_copy(std::move(stream_id));
+    if (stream_id.empty()) {
+        return {};
+    }
+    if (stream_id.rfind("#!::", 0) == 0) {
+        stream_id.erase(0, 4);
+        std::stringstream fields(stream_id);
+        std::string field;
+        while (std::getline(fields, field, ',')) {
+            if (field.rfind("r=", 0) == 0 || field.rfind("stream=", 0) == 0) {
+                const auto equals = field.find('=');
+                return normalize_stream_key(field.substr(equals + 1));
+            }
+        }
+        return {};
+    }
+    if (stream_id.find("app=") != std::string::npos && stream_id.find("stream=") != std::string::npos) {
+        std::string app;
+        std::string name;
+        std::stringstream fields(stream_id);
+        std::string field;
+        while (std::getline(fields, field, '&')) {
+            if (field.rfind("app=", 0) == 0) {
+                app = field.substr(4);
+            } else if (field.rfind("stream=", 0) == 0) {
+                name = field.substr(7);
+            }
+        }
+        if (!app.empty() && !name.empty()) {
+            return normalize_stream_key(app + "/" + name);
+        }
+    }
+    return normalize_stream_key(std::move(stream_id));
+}
+
+std::string stream_key_from_socket(int socket, const std::string& fallback) {
+    std::array<char, 512> buffer{};
+    int length = static_cast<int>(buffer.size());
+    if (srt_getsockflag(socket, SRTO_STREAMID, buffer.data(), &length) != SRT_ERROR && length > 0) {
+        auto stream_key = parse_stream_id(std::string(buffer.data(), static_cast<std::size_t>(length)));
+        if (!stream_key.empty()) {
+            return stream_key;
+        }
+    }
+    return fallback.empty() ? std::string("live/srt-demo") : fallback;
+}
+
 }  // namespace
 
 SrtNativeServer::SrtNativeServer(
@@ -788,8 +909,9 @@ void SrtNativeServer::play_loop() {
 }
 
 void SrtNativeServer::handle_publish_client(int socket) {
-    const auto stream_key = publish_stream_key_.empty() ? std::string("live/srt-demo") : publish_stream_key_;
-    const auto session_key = "cpp-srt-publish:" + stream_key;
+    const auto stream_key = stream_key_from_socket(socket, publish_stream_key_);
+    const auto session_key = "cpp-srt-publish:" + stream_key + ":" + std::to_string(socket);
+    otts::core::log_info("srt_native", "publish client routed to key=" + stream_key);
     registry_.upsert_external_stream(stream_key, otts::media::StreamSource::Srt, "aac", "h264", "cpp-srt-native-publish", true);
     registry_.upsert_external_session(
         session_key,
@@ -910,14 +1032,14 @@ void SrtNativeServer::handle_publish_client(int socket) {
 }
 
 void SrtNativeServer::handle_play_client(int socket) {
-    const auto stream_key = publish_stream_key_.empty() ? std::string("live/srt-demo") : publish_stream_key_;
-    const auto session_key = "cpp-srt-play:" + std::to_string(now_epoch_ms());
+    const auto stream_key = stream_key_from_socket(socket, publish_stream_key_);
+    const auto session_key = "cpp-srt-play:" + stream_key + ":" + std::to_string(socket);
+    otts::core::log_info("srt_native", "play client routed to key=" + stream_key);
     std::mutex mutex;
     std::condition_variable cv;
     std::deque<otts::rtmp::MediaMessage> queue;
     bool alive = true;
-    const auto callback_id = static_cast<otts::rtmp::StreamRegistry::CallbackId>(now_epoch_ms());
-    registry_.update_external_viewers(stream_key, otts::media::StreamSource::Srt, "cpp-srt-native-play", 1);
+    const auto callback_id = next_callback_id();
     registry_.upsert_external_session(
         session_key,
         stream_key,
@@ -943,7 +1065,10 @@ void SrtNativeServer::handle_play_client(int socket) {
             return;
         }
         std::lock_guard<std::mutex> lock(mutex);
-        if (queue.size() > 256) {
+        // The registry snapshot can contain sequence headers plus a 512-packet
+        // GOP. Keep the complete startup snapshot so late SRT clients never
+        // lose SPS/PPS or the keyframe at the front of the GOP.
+        if (queue.size() >= 1024) {
             queue.pop_front();
         }
         queue.push_back(message);
@@ -955,6 +1080,7 @@ void SrtNativeServer::handle_play_client(int socket) {
     std::uint8_t video_cc = 0;
     std::uint8_t audio_cc = 0;
     AacConfig aac_config;
+    std::vector<std::uint8_t> avc_config;
     int sent_count = 0;
     while (running_.load()) {
         otts::rtmp::MediaMessage message;
@@ -974,6 +1100,13 @@ void SrtNativeServer::handle_play_client(int socket) {
             }
             continue;
         }
+        if (message.type_id == 9 && message.payload.size() > 1 && message.payload[1] == 0) {
+            auto parsed = flv_avc_config_to_annexb(message);
+            if (!parsed.empty()) {
+                avc_config = std::move(parsed);
+            }
+            continue;
+        }
         std::vector<std::uint8_t> out;
         if ((sent_count++ % 30) == 0) {
             auto pat = make_pat(pat_cc++);
@@ -985,6 +1118,14 @@ void SrtNativeServer::handle_play_client(int socket) {
             auto annexb = flv_video_to_annexb(message);
             if (annexb.empty()) {
                 continue;
+            }
+            const bool keyframe = (message.payload[0] >> 4) == 1;
+            if (keyframe && !avc_config.empty()) {
+                std::vector<std::uint8_t> configured;
+                configured.reserve(avc_config.size() + annexb.size());
+                configured.insert(configured.end(), avc_config.begin(), avc_config.end());
+                configured.insert(configured.end(), annexb.begin(), annexb.end());
+                annexb = std::move(configured);
             }
             auto pes = make_pes_video(annexb, message.timestamp);
             auto ts = packetize_ts(kVideoPid, pes, video_cc);
@@ -1018,7 +1159,6 @@ void SrtNativeServer::handle_play_client(int socket) {
     }
     alive = false;
     registry_.remove_callback_subscriber(stream_key, callback_id);
-    registry_.update_external_viewers(stream_key, otts::media::StreamSource::Srt, "cpp-srt-native-play", 0);
     registry_.remove_external_session(session_key);
     srt_close(socket);
 }

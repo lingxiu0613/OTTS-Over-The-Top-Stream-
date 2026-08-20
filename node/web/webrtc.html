@@ -179,6 +179,7 @@
           <button id="stopPlay" class="secondary">Stop Play</button>
           <video id="remoteVideo" autoplay playsinline controls></video>
           <p class="muted" id="playStatus">Idle</p>
+          <p class="muted" id="playStats">Video statistics will appear during playback.</p>
         </div>
       </div>
 
@@ -204,6 +205,8 @@
       let playStream = null;
       let playSessionUrl = null;
       let nativeRuntime = null;
+      let playStatsTimer = null;
+      let previousVideoStats = null;
 
       function updateSecurityHint() {
         const hint = document.getElementById("securityHint");
@@ -370,6 +373,71 @@
         }
       }
 
+      function stopPlayStats() {
+        if (playStatsTimer) {
+          clearInterval(playStatsTimer);
+          playStatsTimer = null;
+        }
+        previousVideoStats = null;
+      }
+
+      async function updatePlayStats() {
+        if (!playPc) {
+          return;
+        }
+        try {
+          const reports = await playPc.getStats();
+          let video = null;
+          reports.forEach((report) => {
+            if (
+              report.type === "inbound-rtp" &&
+              !report.isRemote &&
+              (report.kind === "video" || report.mediaType === "video")
+            ) {
+              video = report;
+            }
+          });
+          if (!video) {
+            return;
+          }
+
+          const elapsedSeconds = previousVideoStats
+            ? Math.max(0.001, (video.timestamp - previousVideoStats.timestamp) / 1000)
+            : 0;
+          const bitrateKbps = previousVideoStats && video.bytesReceived >= previousVideoStats.bytesReceived
+            ? ((video.bytesReceived - previousVideoStats.bytesReceived) * 8) / elapsedSeconds / 1000
+            : 0;
+          const measuredFps = previousVideoStats && video.framesDecoded >= previousVideoStats.framesDecoded
+            ? (video.framesDecoded - previousVideoStats.framesDecoded) / elapsedSeconds
+            : 0;
+          const fps = Number(video.framesPerSecond || measuredFps || 0);
+          const jitterMs = Number(video.jitter || 0) * 1000;
+          const bufferMs = video.jitterBufferEmittedCount
+            ? (Number(video.jitterBufferDelay || 0) / video.jitterBufferEmittedCount) * 1000
+            : 0;
+          const width = video.frameWidth || document.getElementById("remoteVideo").videoWidth || 0;
+          const height = video.frameHeight || document.getElementById("remoteVideo").videoHeight || 0;
+          document.getElementById("playStats").textContent =
+            `${width}x${height} | decode ${fps.toFixed(1)} fps | ` +
+            `${bitrateKbps.toFixed(0)} kbps | lost ${video.packetsLost || 0} | ` +
+            `dropped ${video.framesDropped || 0} | jitter ${jitterMs.toFixed(1)} ms | ` +
+            `buffer ${bufferMs.toFixed(1)} ms`;
+          previousVideoStats = {
+            timestamp: video.timestamp,
+            bytesReceived: video.bytesReceived || 0,
+            framesDecoded: video.framesDecoded || 0
+          };
+        } catch (error) {
+          document.getElementById("playStats").textContent = `Statistics unavailable: ${error.message}`;
+        }
+      }
+
+      function startPlayStats() {
+        stopPlayStats();
+        updatePlayStats();
+        playStatsTimer = setInterval(updatePlayStats, 1000);
+      }
+
       async function startPublish() {
         const { streamKey, url } = getPublishTarget();
         if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
@@ -498,6 +566,7 @@
             const text = await answerResponse.text();
             throw new Error(text || `native WHEP answer failed: ${answerResponse.status}`);
           }
+          startPlayStats();
           document.getElementById("playStatus").textContent = `Playing ${streamKey}`;
           log("Native WHEP playback established", { streamKey, offerUrl, sessionUrl: playSessionUrl });
           return;
@@ -525,11 +594,13 @@
           ? `${proxyBase}${response.headers.get("Location")}`
           : null;
         await playPc.setRemoteDescription({ type: "answer", sdp: answerSdp });
+        startPlayStats();
         document.getElementById("playStatus").textContent = `Playing ${streamKey}`;
         log("WHEP playback established", { streamKey, url, sessionUrl: playSessionUrl });
       }
 
       async function stopPlay() {
+        stopPlayStats();
         if (playSessionUrl) {
           await fetch(playSessionUrl, { method: "DELETE" }).catch(() => {});
           playSessionUrl = null;
@@ -545,6 +616,7 @@
         remoteVideo.load();
         playStream = null;
         document.getElementById("playStatus").textContent = "Stopped";
+        document.getElementById("playStats").textContent = "Video statistics will appear during playback.";
       }
 
       document.getElementById("startPublish").addEventListener("click", async () => {

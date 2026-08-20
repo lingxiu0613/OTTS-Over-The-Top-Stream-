@@ -2,13 +2,16 @@
 import argparse
 import asyncio
 import fractions
+import math
+import struct
 import time
 
 
 try:
     import aiohttp
     from aiortc import RTCPeerConnection, RTCSessionDescription, RTCRtpSender, VideoStreamTrack
-    from av import VideoFrame
+    from aiortc.mediastreams import AudioStreamTrack
+    from av import AudioFrame, VideoFrame
 except Exception as exc:  # pragma: no cover - smoke environment guard
     print(f"[OTTS] WHIP/WHEP smoke skipped: missing Python WebRTC dependency: {exc}")
     raise SystemExit(0)
@@ -37,6 +40,31 @@ class SyntheticVideo(VideoStreamTrack):
         return frame
 
 
+class SyntheticAudio(AudioStreamTrack):
+    sample_rate = 48000
+    samples_per_frame = 960
+
+    def __init__(self):
+        super().__init__()
+        self.pts = 0
+        self.phase = 0
+
+    async def recv(self):
+        await asyncio.sleep(self.samples_per_frame / self.sample_rate)
+        frame = AudioFrame(format="s16", layout="stereo", samples=self.samples_per_frame)
+        frame.sample_rate = self.sample_rate
+        frame.pts = self.pts
+        frame.time_base = fractions.Fraction(1, self.sample_rate)
+        pcm = bytearray()
+        for index in range(self.samples_per_frame):
+            sample = int(5000 * math.sin(2 * math.pi * 440 * (self.phase + index) / self.sample_rate))
+            pcm.extend(struct.pack("<hh", sample, sample))
+        frame.planes[0].update(bytes(pcm))
+        self.pts += self.samples_per_frame
+        self.phase += self.samples_per_frame
+        return frame
+
+
 async def post_sdp(url, sdp):
     async with aiohttp.ClientSession() as session:
         async with session.post(url, data=sdp, headers={"Content-Type": "application/sdp"}) as response:
@@ -57,6 +85,18 @@ async def delete_session(base_url, location):
             print(f"[OTTS] DELETE {url} -> {response.status}")
 
 
+async def print_runtime_snapshot(base_url, stream_key):
+    async with aiohttp.ClientSession() as session:
+        async with session.get(f"{base_url}/api/streams") as response:
+            payload = await response.json()
+            streams = [item for item in payload.get("streams", []) if item.get("stream_key") == stream_key]
+            print(f"[OTTS] stream snapshot: {streams}")
+        async with session.get(f"{base_url}/api/webrtc/sessions") as response:
+            payload = await response.json()
+            sessions = [item for item in payload.get("sessions", []) if item.get("stream_key") == stream_key]
+            print(f"[OTTS] WebRTC snapshot: {sessions}")
+
+
 def prefer_h264(transceiver):
     capabilities = RTCRtpSender.getCapabilities("video")
     h264 = [codec for codec in capabilities.codecs if codec.mimeType.lower() == "video/h264"]
@@ -69,6 +109,7 @@ async def publish(base_url, stream_key, duration):
     pc = RTCPeerConnection()
     transceiver = pc.addTransceiver(SyntheticVideo(), direction="sendonly")
     prefer_h264(transceiver)
+    pc.addTransceiver(SyntheticAudio(), direction="sendonly")
     offer = await pc.createOffer()
     await pc.setLocalDescription(offer)
     url = f"{base_url}/rtc/v1/whip/?app={stream_key.split('/', 1)[0]}&stream={stream_key.split('/', 1)[1]}"
@@ -82,6 +123,7 @@ async def publish(base_url, stream_key, duration):
 async def play(base_url, stream_key, timeout):
     pc = RTCPeerConnection()
     counts = {"video": 0, "audio": 0}
+    arrivals = {"video": [], "audio": []}
 
     @pc.on("track")
     def on_track(track):
@@ -93,6 +135,7 @@ async def play(base_url, stream_key, timeout):
                 except Exception:
                     break
                 counts[track.kind] = counts.get(track.kind, 0) + 1
+                arrivals.setdefault(track.kind, []).append(time.monotonic())
 
         asyncio.ensure_future(receive())
 
@@ -103,12 +146,24 @@ async def play(base_url, stream_key, timeout):
     url = f"{base_url}/rtc/v1/whep/?app={stream_key.split('/', 1)[0]}&stream={stream_key.split('/', 1)[1]}"
     answer, location = await post_sdp(url, pc.localDescription.sdp)
     await pc.setRemoteDescription(RTCSessionDescription(sdp=answer, type="answer"))
-    await asyncio.sleep(timeout)
+    await asyncio.sleep(timeout / 2)
+    await print_runtime_snapshot(base_url, stream_key)
+    await asyncio.sleep(timeout / 2)
     await delete_session(base_url, location)
     await pc.close()
     print(f"[OTTS] WHEP received frames: {counts}")
+    for kind, times in arrivals.items():
+        intervals = sorted((right - left) * 1000 for left, right in zip(times, times[1:]))
+        if intervals:
+            p95 = intervals[min(len(intervals) - 1, int(len(intervals) * 0.95))]
+            print(
+                f"[OTTS] WHEP {kind} pacing ms: "
+                f"p50={intervals[len(intervals) // 2]:.1f} p95={p95:.1f} max={intervals[-1]:.1f}"
+            )
     if counts["video"] <= 0:
         raise RuntimeError("WHEP did not receive video frames")
+    if counts["audio"] <= 0:
+        raise RuntimeError("WHEP did not receive audio frames")
 
 
 async def main():
@@ -116,13 +171,17 @@ async def main():
     parser.add_argument("--base-url", default="http://127.0.0.1:1985")
     parser.add_argument("--stream-key", default="live/webrtc-smoke")
     parser.add_argument("--duration", type=float, default=8.0)
+    parser.add_argument("--play-only", action="store_true")
     args = parser.parse_args()
     if "/" not in args.stream_key:
         raise SystemExit("stream key must look like app/stream")
-    publisher = asyncio.create_task(publish(args.base_url, args.stream_key, args.duration + 2))
-    await asyncio.sleep(2)
-    await play(args.base_url, args.stream_key, args.duration)
-    await publisher
+    if args.play_only:
+        await play(args.base_url, args.stream_key, args.duration)
+    else:
+        publisher = asyncio.create_task(publish(args.base_url, args.stream_key, args.duration + 2))
+        await asyncio.sleep(2)
+        await play(args.base_url, args.stream_key, args.duration)
+        await publisher
     print("[OTTS] native WHIP/WHEP smoke OK")
 
 

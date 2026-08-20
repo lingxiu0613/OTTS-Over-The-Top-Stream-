@@ -5,8 +5,14 @@ a Node.js control plane and web console, and Python for smoke tests and optional
 compatibility tooling.
 
 The current development snapshot has been validated with H.264 video and AAC
-audio across RTMP, HTTP-FLV, HLS, RTSP, and SRT. Native WHIP/WHEP uses H.264
-video and Opus audio through libdatachannel.
+audio across the shared media core, RTMP, HTTP-FLV, HLS, RTSP, and SRT. Native
+WHIP/WHEP uses H.264 video and standards-compatible Opus on the WebRTC wire;
+the C++ media core transcodes WHIP Opus to AAC and WHEP AAC back to Opus.
+
+This README describes the development snapshot after `v0.3.0`. The working
+tree adds native WebRTC audio bridging, paced WHEP playback, dynamic SRT stream
+routing, and multi-session SRT egress. H.265 is a planned next-stage feature
+and is not part of this snapshot.
 
 ## Current Status
 
@@ -26,8 +32,9 @@ Implemented runtime features include:
 - H.264/AAC sequence-header caching and late-subscriber startup;
 - stream health, session, disconnect, and Prometheus-style metrics APIs;
 - SRS-compatible WHIP/WHEP HTTP endpoints;
+- per-session Opus/AAC audio transcoding between WebRTC and the shared core;
 - RTSP H.264/AAC RTP over UDP publish and UDP/TCP-interleaved play;
-- SRT listener-mode ingest and egress;
+- SRT listener-mode ingest and dynamic multi-session egress routing;
 - HTTP-FLV slow-client protection and connection statistics;
 - HLS readiness, master playlist, restart, and cleanup management;
 - FLV/MP4 recording lifecycle;
@@ -93,7 +100,8 @@ sudo apt install -y \
   ffmpeg curl openssl psmisc iproute2 \
   nodejs npm python3 \
   libssl-dev libsrt-openssl-dev \
-  libnice-dev libsrtp2-dev libusrsctp-dev
+  libnice-dev libsrtp2-dev libusrsctp-dev \
+  libavcodec-dev libavutil-dev libswresample-dev
 ```
 
 Install the Node dependency:
@@ -219,6 +227,28 @@ over UDP also negotiates dynamic RTP/RTCP UDP ports.
 
 Replace `192.168.40.11` and the media filename as needed.
 
+### Cross-Protocol Fanout
+
+One publisher can feed multiple protocol outputs through the shared C++ stream
+registry. Publish one H.264/AAC stream:
+
+```bash
+ffmpeg -re -i news_1280x720.mp4 \
+  -c copy -f flv \
+  rtmp://192.168.40.11:1935/live/nolo001
+```
+
+The same `live/nolo001` stream can then be played concurrently through:
+
+```text
+RTMP: rtmp://192.168.40.11:1935/live/nolo001
+RTSP: rtsp://192.168.40.11:8556/live__nolo001.sdp
+WHEP: http://192.168.40.11:1985/rtc/v1/whep/?app=live&stream=nolo001
+SRT:  srt://192.168.40.11:10000?mode=caller&transtype=live&streamid=live/nolo001
+```
+
+This path performs remuxing and protocol conversion, not video transcoding.
+
 ### RTMP
 
 Publish:
@@ -270,6 +300,18 @@ The first URL can be used by OBS WHIP output. The browser test page is:
 https://192.168.40.11:3443/webrtc.html
 ```
 
+WebRTC negotiates Opus audio with OBS and browsers. OTTS stores WHIP audio as
+AAC in the shared stream registry, allowing the same stream to be consumed by
+AAC-based outputs. WHEP accepts AAC from RTMP, RTSP, SRT, or WHIP sources and
+transcodes it to Opus for the WebRTC receiver.
+
+The WHEP sender preserves the complete cached GOP and AVC sequence headers,
+paces output by media timestamps, and waits for the next keyframe after a slow
+client queue overflow. The browser test page reports decoded FPS, receive
+bitrate, packet loss, dropped frames, jitter, and jitter-buffer delay. For a
+1280x720 30 fps input, the page should normally report approximately 30 decoded
+fps with zero packet loss and zero dropped frames.
+
 When the configured certificate files do not exist, the Node control plane
 uses OpenSSL to generate a local self-signed development certificate. The key
 is ignored by Git. A browser warning is expected until a trusted certificate is
@@ -313,10 +355,15 @@ ffmpeg -re -i news_1280x720.mp4 \
 Play:
 
 ```bash
-ffplay "srt://192.168.40.11:10000?mode=caller&transtype=live"
+ffplay "srt://192.168.40.11:10000?mode=caller&transtype=live&streamid=live/nolo001"
 ```
 
-The default listener pair maps to `live/srt-demo`.
+`streamid` selects any online `app/stream` from the shared C++ stream registry,
+so an RTMP publisher at `live/nolo001` can be pulled through SRT without changing
+server configuration. The play listener supports concurrent clients and different
+stream IDs on the same UDP port. OTTS also accepts Haivision-style stream IDs such
+as `#!::r=live/nolo001,m=request`; when `streamid` is omitted, the configured
+`OTTS_CPP_SRT_STREAM_KEY` remains the compatibility fallback.
 
 ## Web Console And APIs
 
@@ -392,7 +439,21 @@ bash scripts/smoke_rtmp.sh live/rtmp-smoke
 bash scripts/smoke_rtsp.sh /path/to/input.mp4 live/rtsp-smoke
 bash scripts/smoke_srt.sh /path/to/input.mp4 live/srt-smoke
 bash scripts/smoke_hls.sh live/hls-smoke
+python3 python/smoke_webrtc_native.py \
+  --base-url http://127.0.0.1:1985 \
+  --stream-key live/webrtc-smoke --duration 8
 ```
+
+Test WHEP playback against an already-published stream:
+
+```bash
+python3 python/smoke_webrtc_native.py \
+  --base-url http://127.0.0.1:1985 \
+  --stream-key live/nolo001 --duration 10 --play-only
+```
+
+The WebRTC smoke test verifies both video and audio and reports video/audio
+frame counts plus P50, P95, and maximum receive intervals.
 
 Full suite:
 
@@ -421,13 +482,16 @@ Build directories, local configuration, test media, archives, logs,
 
 ## Current Limits
 
-- Media processing is remux/passthrough; OTTS is not a transcoding server.
+- Video processing is remux/passthrough. The native WebRTC adapter transcodes
+  audio between Opus on the wire and AAC in the shared core.
 - The primary tested video/audio combination is H.264 + AAC.
-- Native WHIP/WHEP uses browser/OBS-compatible H.264 + Opus.
+- Native WHIP/WHEP uses browser/OBS-compatible H.264 + Opus on the wire and
+  exposes AAC audio to the rest of OTTS.
 - H.265, cluster forwarding, replay, and production certificate automation are
   planned rather than complete.
 - HLS and recording still use managed FFmpeg workers.
-- The current default SRT listener pair represents one predefined stream.
+- SRT callers that omit `streamid` use the configured compatibility fallback
+  stream.
 
 ## License And Contributions
 

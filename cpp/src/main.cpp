@@ -281,7 +281,7 @@ otts::webrtc::NativeStatus build_webrtc_native_status(const std::string& mode_te
     status.media_engine_ready = true;
     status.selected_runtime =
         (status.configured_mode == otts::webrtc::RuntimeMode::Gateway) ? "gateway" : "native";
-    status.detail = "native WHIP/WHEP H.264 + Opus path enabled through libdatachannel";
+    status.detail = "native WHIP/WHEP ready: H.264 + Opus wire, AAC core audio";
 #else
     status.selected_runtime =
         (status.configured_mode == otts::webrtc::RuntimeMode::Native) ? "native" : "gateway";
