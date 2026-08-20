@@ -1,6 +1,7 @@
 #include "otts/rtsp/rtsp_publish_server.hpp"
 
 #include "otts/auth/stream_auth.hpp"
+#include "otts/codec/video_codec.hpp"
 #include "otts/core/logger.hpp"
 
 #include <arpa/inet.h>
@@ -12,9 +13,11 @@
 #include <array>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <cctype>
 #include <cstring>
 #include <mutex>
+#include <numeric>
 #include <optional>
 #include <sstream>
 #include <string_view>
@@ -59,18 +62,6 @@ bool send_all(int fd, std::string_view data) {
         offset += static_cast<std::size_t>(written);
     }
     return true;
-}
-
-void write_be16(std::vector<std::uint8_t>& out, std::uint16_t value) {
-    out.push_back(static_cast<std::uint8_t>((value >> 8) & 0xff));
-    out.push_back(static_cast<std::uint8_t>(value & 0xff));
-}
-
-void write_be32(std::vector<std::uint8_t>& out, std::uint32_t value) {
-    out.push_back(static_cast<std::uint8_t>((value >> 24) & 0xff));
-    out.push_back(static_cast<std::uint8_t>((value >> 16) & 0xff));
-    out.push_back(static_cast<std::uint8_t>((value >> 8) & 0xff));
-    out.push_back(static_cast<std::uint8_t>(value & 0xff));
 }
 
 std::string query_value(const std::string& uri, const std::string& key) {
@@ -236,9 +227,43 @@ int bind_udp_port(std::uint16_t& port) {
 }
 
 struct NalSets {
+    std::vector<std::uint8_t> vps;
     std::vector<std::uint8_t> sps;
     std::vector<std::uint8_t> pps;
 };
+
+otts::media::CodecId parse_sdp_video_codec(const std::string& sdp) {
+    const auto value = lower(sdp);
+    return value.find(" h265/90000") != std::string::npos || value.find(" hevc/90000") != std::string::npos
+        ? otts::media::CodecId::Hevc
+        : otts::media::CodecId::Avc;
+}
+
+std::uint32_t parse_sdp_frame_interval_ms(const std::string& sdp) {
+    std::istringstream lines(sdp);
+    std::string line;
+    while (std::getline(lines, line)) {
+        line = lower(trim(std::move(line)));
+        constexpr std::string_view frame_rate = "a=framerate:";
+        constexpr std::string_view x_frame_rate = "a=x-framerate:";
+        std::string value;
+        if (line.rfind(frame_rate, 0) == 0) {
+            value = line.substr(frame_rate.size());
+        } else if (line.rfind(x_frame_rate, 0) == 0) {
+            value = line.substr(x_frame_rate.size());
+        } else {
+            continue;
+        }
+        try {
+            const auto fps = std::stod(value);
+            if (fps >= 1.0 && fps <= 240.0) {
+                return static_cast<std::uint32_t>(std::max(1.0, std::round(1000.0 / fps)));
+            }
+        } catch (...) {
+        }
+    }
+    return 0;
+}
 
 struct AacSdpConfig {
     bool present{false};
@@ -401,138 +426,30 @@ NalSets parse_sdp_sets(const std::string& sdp) {
     while (std::getline(lines, line)) {
         const auto marker = std::string("sprop-parameter-sets=");
         const auto pos = line.find(marker);
-        if (pos == std::string::npos) {
-            continue;
+        if (pos != std::string::npos) {
+            auto value = line.substr(pos + marker.size());
+            const auto semicolon = value.find(';');
+            if (semicolon != std::string::npos) value.resize(semicolon);
+            const auto comma = value.find(',');
+            if (comma != std::string::npos) {
+                sets.sps = base64_decode(value.substr(0, comma));
+                sets.pps = base64_decode(value.substr(comma + 1));
+            }
         }
-        auto value = line.substr(pos + marker.size());
-        const auto semicolon = value.find(';');
-        if (semicolon != std::string::npos) {
-            value = value.substr(0, semicolon);
+        const auto parse_hevc_set = [&](const std::string& name, std::vector<std::uint8_t>& target) {
+            const auto key = name + "=";
+            const auto begin = line.find(key);
+            if (begin == std::string::npos) return;
+            auto value = line.substr(begin + key.size());
+            const auto end = value.find(';');
+            if (end != std::string::npos) value.resize(end);
+            target = base64_decode(trim(std::move(value)));
+        };
+        parse_hevc_set("sprop-vps", sets.vps);
+        parse_hevc_set("sprop-sps", sets.sps);
+        parse_hevc_set("sprop-pps", sets.pps);
         }
-        const auto comma = value.find(',');
-        if (comma != std::string::npos) {
-            sets.sps = base64_decode(value.substr(0, comma));
-            sets.pps = base64_decode(value.substr(comma + 1));
-        }
-    }
     return sets;
-}
-
-void extract_sets_from_annexb(const std::vector<std::uint8_t>& au, NalSets& sets) {
-    for (std::size_t i = 0; i + 4 < au.size();) {
-        std::size_t code = 0;
-        if (au[i] == 0 && au[i + 1] == 0 && au[i + 2] == 1) {
-            code = 3;
-        } else if (i + 4 < au.size() && au[i] == 0 && au[i + 1] == 0 && au[i + 2] == 0 && au[i + 3] == 1) {
-            code = 4;
-        } else {
-            ++i;
-            continue;
-        }
-        const auto start = i + code;
-        auto end = start;
-        while (end + 3 < au.size() && !(au[end] == 0 && au[end + 1] == 0 && (au[end + 2] == 1 || (end + 3 < au.size() && au[end + 2] == 0 && au[end + 3] == 1)))) {
-            ++end;
-        }
-        if (end + 3 >= au.size()) {
-            end = au.size();
-        }
-        if (end > start) {
-            const auto type = au[start] & 0x1f;
-            if (type == 7) {
-                sets.sps.assign(au.begin() + static_cast<std::ptrdiff_t>(start), au.begin() + static_cast<std::ptrdiff_t>(end));
-            } else if (type == 8) {
-                sets.pps.assign(au.begin() + static_cast<std::ptrdiff_t>(start), au.begin() + static_cast<std::ptrdiff_t>(end));
-            }
-        }
-        i = end;
-    }
-}
-
-bool has_idr(const std::vector<std::uint8_t>& au) {
-    for (std::size_t i = 0; i + 4 < au.size(); ++i) {
-        const bool code3 = au[i] == 0 && au[i + 1] == 0 && au[i + 2] == 1;
-        const bool code4 = i + 4 < au.size() && au[i] == 0 && au[i + 1] == 0 && au[i + 2] == 0 && au[i + 3] == 1;
-        if (code3 || code4) {
-            const auto nal = i + (code3 ? 3 : 4);
-            if (nal < au.size() && (au[nal] & 0x1f) == 5) {
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
-std::vector<std::uint8_t> annexb_to_avcc(const std::vector<std::uint8_t>& au) {
-    std::vector<std::uint8_t> out;
-    for (std::size_t i = 0; i + 3 < au.size();) {
-        std::size_t code = 0;
-        if (au[i] == 0 && au[i + 1] == 0 && au[i + 2] == 1) {
-            code = 3;
-        } else if (i + 4 < au.size() && au[i] == 0 && au[i + 1] == 0 && au[i + 2] == 0 && au[i + 3] == 1) {
-            code = 4;
-        } else {
-            ++i;
-            continue;
-        }
-        const auto start = i + code;
-        auto end = start;
-        while (end + 3 < au.size() && !(au[end] == 0 && au[end + 1] == 0 && (au[end + 2] == 1 || (end + 3 < au.size() && au[end + 2] == 0 && au[end + 3] == 1)))) {
-            ++end;
-        }
-        if (end + 3 >= au.size()) {
-            end = au.size();
-        }
-        const auto size = end > start ? end - start : 0;
-        if (size > 0) {
-            write_be32(out, static_cast<std::uint32_t>(size));
-            out.insert(out.end(), au.begin() + static_cast<std::ptrdiff_t>(start), au.begin() + static_cast<std::ptrdiff_t>(end));
-        }
-        i = end;
-    }
-    return out;
-}
-
-otts::rtmp::MediaMessage make_avc_sequence_header(std::uint32_t timestamp, const NalSets& sets) {
-    otts::rtmp::MediaMessage message;
-    message.timestamp = timestamp;
-    message.type_id = 9;
-    message.message_stream_id = 1;
-    message.payload = {0x17, 0x00, 0x00, 0x00, 0x00, 0x01};
-    message.payload.push_back(sets.sps.size() > 1 ? sets.sps[1] : 0x64);
-    message.payload.push_back(sets.sps.size() > 2 ? sets.sps[2] : 0x00);
-    message.payload.push_back(sets.sps.size() > 3 ? sets.sps[3] : 0x1f);
-    message.payload.push_back(0xff);
-    message.payload.push_back(0xe1);
-    write_be16(message.payload, static_cast<std::uint16_t>(sets.sps.size()));
-    message.payload.insert(message.payload.end(), sets.sps.begin(), sets.sps.end());
-    message.payload.push_back(0x01);
-    write_be16(message.payload, static_cast<std::uint16_t>(sets.pps.size()));
-    message.payload.insert(message.payload.end(), sets.pps.begin(), sets.pps.end());
-    return message;
-}
-
-void write_signed_be24(std::vector<std::uint8_t>& out, std::int32_t value) {
-    const auto masked = static_cast<std::uint32_t>(value) & 0x00ffffff;
-    out.push_back(static_cast<std::uint8_t>((masked >> 16) & 0xff));
-    out.push_back(static_cast<std::uint8_t>((masked >> 8) & 0xff));
-    out.push_back(static_cast<std::uint8_t>(masked & 0xff));
-}
-
-otts::rtmp::MediaMessage make_avc_nalu_message(
-    std::uint32_t dts_ms,
-    std::int32_t composition_time_ms,
-    const std::vector<std::uint8_t>& au) {
-    otts::rtmp::MediaMessage message;
-    message.timestamp = dts_ms;
-    message.type_id = 9;
-    message.message_stream_id = 1;
-    message.payload.push_back(static_cast<std::uint8_t>((has_idr(au) ? 0x10 : 0x20) | 0x07));
-    message.payload.push_back(0x01);
-    write_signed_be24(message.payload, composition_time_ms);
-    auto avcc = annexb_to_avcc(au);
-    message.payload.insert(message.payload.end(), avcc.begin(), avcc.end());
-    return message;
 }
 
 otts::rtmp::MediaMessage make_aac_message(
@@ -658,10 +575,20 @@ private:
     bool sent_sequence_{false};
 };
 
-class H264RtpIngest {
+class VideoRtpIngest {
 public:
-    H264RtpIngest(otts::rtmp::StreamRegistry& registry, std::string stream_key, NalSets sets)
-        : registry_(registry), stream_key_(std::move(stream_key)), sets_(std::move(sets)) {}
+    VideoRtpIngest(
+        otts::rtmp::StreamRegistry& registry,
+        std::string stream_key,
+        NalSets sets,
+        otts::media::CodecId codec,
+        std::uint32_t frame_interval_ms)
+        : registry_(registry),
+          stream_key_(std::move(stream_key)),
+          sets_(std::move(sets)),
+          codec_(codec),
+          frame_interval_ms_(frame_interval_ms == 0 ? 33 : frame_interval_ms),
+          frame_interval_from_sdp_(frame_interval_ms != 0) {}
 
     void handle_packet(const std::uint8_t* packet, std::size_t size) {
         if (size < 12 || (packet[0] >> 6) != 2) {
@@ -694,12 +621,16 @@ public:
             return;
         }
 
-        const auto nal_type = payload[0] & 0x1f;
-        if (nal_type >= 1 && nal_type <= 23) {
+        const auto nal_type = codec_ == otts::media::CodecId::Hevc
+            ? static_cast<std::uint8_t>((payload[0] >> 1) & 0x3f)
+            : static_cast<std::uint8_t>(payload[0] & 0x1f);
+        if ((codec_ == otts::media::CodecId::Avc && nal_type >= 1 && nal_type <= 23) ||
+            (codec_ == otts::media::CodecId::Hevc && nal_type <= 47)) {
             append_start_code();
             current_au_.insert(current_au_.end(), payload, payload + payload_size);
-        } else if (nal_type == 24) {
-            std::size_t cursor = 1;
+        } else if ((codec_ == otts::media::CodecId::Avc && nal_type == 24) ||
+                   (codec_ == otts::media::CodecId::Hevc && nal_type == 48)) {
+            std::size_t cursor = codec_ == otts::media::CodecId::Hevc ? 2 : 1;
             while (cursor + 2 <= payload_size) {
                 const auto nal_size = static_cast<std::size_t>((payload[cursor] << 8) | payload[cursor + 1]);
                 cursor += 2;
@@ -710,7 +641,7 @@ public:
                 current_au_.insert(current_au_.end(), payload + cursor, payload + cursor + nal_size);
                 cursor += nal_size;
             }
-        } else if (nal_type == 28 && payload_size >= 2) {
+        } else if (codec_ == otts::media::CodecId::Avc && nal_type == 28 && payload_size >= 2) {
             const bool start = (payload[1] & 0x80) != 0;
             const auto reconstructed = static_cast<std::uint8_t>((payload[0] & 0xe0) | (payload[1] & 0x1f));
             if (start) {
@@ -718,62 +649,86 @@ public:
                 current_au_.push_back(reconstructed);
             }
             current_au_.insert(current_au_.end(), payload + 2, payload + payload_size);
+        } else if (codec_ == otts::media::CodecId::Hevc && nal_type == 49 && payload_size >= 3) {
+            const bool start = (payload[2] & 0x80) != 0;
+            const auto original_type = static_cast<std::uint8_t>(payload[2] & 0x3f);
+            if (start) {
+                append_start_code();
+                current_au_.push_back(static_cast<std::uint8_t>((payload[0] & 0x81) | (original_type << 1)));
+                current_au_.push_back(payload[1]);
+            }
+            current_au_.insert(current_au_.end(), payload + 3, payload + payload_size);
         }
 
         if (marker && !current_au_.empty()) {
-            const auto timestamp_ms = next_monotonic_timestamp_ms(rtp_ts);
-            publish(timestamp_ms);
+            const auto timing = next_timing(rtp_ts);
+            publish(timing.dts_ms, timing.composition_time_ms);
             current_au_.clear();
         }
     }
 
 private:
-    std::uint32_t next_monotonic_timestamp_ms(std::uint32_t rtp_ts) {
+    struct VideoTiming {
+        std::uint32_t dts_ms{0};
+        std::int32_t composition_time_ms{0};
+    };
+
+    VideoTiming next_timing(std::uint32_t rtp_ts) {
         if (!last_rtp_ts_.has_value()) {
             last_rtp_ts_ = rtp_ts;
-            monotonic_timestamp_ms_ = 0;
-            return *monotonic_timestamp_ms_;
+            return {};
         }
-        std::uint32_t delta_ms = frame_interval_ms_;
-        if (rtp_ts >= *last_rtp_ts_) {
-            const auto observed_ms = static_cast<std::uint32_t>(
-                (static_cast<std::uint64_t>(rtp_ts - *last_rtp_ts_) * 1000) / 90000);
-            if (observed_ms >= 10 && observed_ms <= 100) {
-                delta_ms = observed_ms;
-                frame_interval_ms_ = observed_ms;
+
+        const auto signed_delta_ticks = static_cast<std::int32_t>(rtp_ts - *last_rtp_ts_);
+        const auto absolute_delta_ticks = static_cast<std::uint32_t>(
+            signed_delta_ticks < 0 ? -static_cast<std::int64_t>(signed_delta_ticks) : signed_delta_ticks);
+        if (!frame_interval_from_sdp_ && absolute_delta_ticks > 0) {
+            timestamp_delta_gcd_ = timestamp_delta_gcd_ == 0
+                ? absolute_delta_ticks : std::gcd(timestamp_delta_gcd_, absolute_delta_ticks);
+            const auto candidate_ms = static_cast<std::uint32_t>(
+                (static_cast<std::uint64_t>(timestamp_delta_gcd_) * 1000 + 45000) / 90000);
+            if (candidate_ms >= 4 && candidate_ms <= 100) {
+                frame_interval_ms_ = candidate_ms;
             }
         }
-        *monotonic_timestamp_ms_ += delta_ms;
+
+        presentation_ticks_ += signed_delta_ticks;
+        decode_timestamp_ms_ += frame_interval_ms_;
         last_rtp_ts_ = rtp_ts;
-        return *monotonic_timestamp_ms_;
+        const auto presentation_ms = (presentation_ticks_ * 1000) / 90000;
+        const auto composition = presentation_ms - static_cast<std::int64_t>(decode_timestamp_ms_);
+        return {
+            decode_timestamp_ms_,
+            static_cast<std::int32_t>(std::clamp<std::int64_t>(composition, -8388608, 8388607))};
     }
 
     void append_start_code() {
         current_au_.insert(current_au_.end(), {0x00, 0x00, 0x00, 0x01});
     }
 
-    void publish(std::uint32_t timestamp_ms) {
-        extract_sets_from_annexb(current_au_, sets_);
-        if (!sent_sequence_ && !sets_.sps.empty() && !sets_.pps.empty()) {
+    void publish(std::uint32_t dts_ms, std::int32_t composition_time_ms) {
+        const auto parsed_sets = otts::codec::extract_parameter_sets(current_au_, codec_);
+        if (!parsed_sets.vps.empty()) sets_.vps = parsed_sets.vps;
+        if (!parsed_sets.sps.empty()) sets_.sps = parsed_sets.sps;
+        if (!parsed_sets.pps.empty()) sets_.pps = parsed_sets.pps;
+        otts::codec::ParameterSets codec_sets{sets_.vps, sets_.sps, sets_.pps};
+        if (!sent_sequence_ && codec_sets.complete(codec_)) {
+            otts::rtmp::MediaMessage config;
+            config.timestamp = dts_ms;
+            config.type_id = 9;
+            config.payload = otts::codec::make_flv_video_config(codec_, codec_sets);
             registry_.publish_external_media(
                 stream_key_,
                 otts::media::StreamSource::Rtsp,
                 "cpp-rtsp-native-publish",
-                make_avc_sequence_header(timestamp_ms, sets_));
+                config);
             sent_sequence_ = true;
         }
-        if (last_pts_ms_.has_value() && timestamp_ms > *last_pts_ms_) {
-            frame_interval_ms_ = std::max<std::uint32_t>(1, timestamp_ms - *last_pts_ms_);
-        }
-        std::uint32_t dts_ms = timestamp_ms;
-        if (last_dts_ms_.has_value() && dts_ms <= *last_dts_ms_) {
-            dts_ms = *last_dts_ms_ + frame_interval_ms_;
-        }
-        const auto composition_time_ms =
-            static_cast<std::int32_t>(timestamp_ms) - static_cast<std::int32_t>(dts_ms);
-        last_pts_ms_ = timestamp_ms;
-        last_dts_ms_ = dts_ms;
-        auto message = make_avc_nalu_message(dts_ms, composition_time_ms, current_au_);
+        otts::rtmp::MediaMessage message;
+        message.timestamp = dts_ms;
+        message.type_id = 9;
+        message.payload = otts::codec::make_flv_video_sample(
+            codec_, current_au_, otts::codec::is_keyframe(current_au_, codec_), composition_time_ms);
         if (message.payload.size() > 5) {
             registry_.publish_external_media(stream_key_, otts::media::StreamSource::Rtsp, "cpp-rtsp-native-publish", message);
         }
@@ -782,11 +737,13 @@ private:
     otts::rtmp::StreamRegistry& registry_;
     std::string stream_key_;
     NalSets sets_;
+    otts::media::CodecId codec_{otts::media::CodecId::Avc};
     std::optional<std::uint32_t> last_rtp_ts_;
-    std::optional<std::uint32_t> monotonic_timestamp_ms_;
-    std::optional<std::uint32_t> last_pts_ms_;
-    std::optional<std::uint32_t> last_dts_ms_;
+    std::int64_t presentation_ticks_{0};
+    std::uint32_t decode_timestamp_ms_{0};
+    std::uint32_t timestamp_delta_gcd_{0};
     std::uint32_t frame_interval_ms_{33};
+    bool frame_interval_from_sdp_{false};
     std::vector<std::uint8_t> current_au_;
     bool sent_sequence_{false};
 };
@@ -859,6 +816,8 @@ void RtspPublishServer::handle_client(int client_fd) {
     std::string buffer;
     std::string stream_key;
     NalSets sets;
+    otts::media::CodecId video_codec = otts::media::CodecId::Avc;
+    std::uint32_t video_frame_interval_ms = 0;
     AacSdpConfig aac_config;
     std::uint16_t video_rtp_port = 0;
     std::uint16_t video_rtcp_port = 0;
@@ -955,12 +914,16 @@ void RtspPublishServer::handle_client(int client_fd) {
             }
             if (request->method == "ANNOUNCE") {
                 sets = parse_sdp_sets(request->body);
+                video_codec = parse_sdp_video_codec(request->body);
+                video_frame_interval_ms = parse_sdp_frame_interval_ms(request->body);
                 aac_config = parse_sdp_aac(request->body);
+                registry_.begin_external_publish(
+                    stream_key, otts::media::StreamSource::Rtsp, "cpp-rtsp-native-publish");
                 registry_.upsert_external_stream(
                     stream_key,
                     otts::media::StreamSource::Rtsp,
                     aac_config.present ? "aac" : "",
-                    "h264",
+                    otts::media::to_string(video_codec),
                     "cpp-rtsp-native-publish",
                     true);
                 registry_.upsert_external_session(
@@ -974,9 +937,9 @@ void RtspPublishServer::handle_client(int client_fd) {
                     "rtsp://0.0.0.0:" + std::to_string(port_),
                     "stream-registry",
                     "rtsp/rtp/udp",
-                    aac_config.present ? "cxx-rtsp-h264-aac-rtp-demux" : "cxx-rtsp-h264-rtp-demux",
+                    video_codec == otts::media::CodecId::Hevc ? "cxx-rtsp-h265-rtp-demux" : "cxx-rtsp-h264-rtp-demux",
                     "native-cxx",
-                    aac_config.present ? "h264/aac" : "h264",
+                    otts::media::to_string(video_codec) + (aac_config.present ? "/aac" : ""),
                     0,
                     now_epoch_ms(),
                     0,
@@ -1066,7 +1029,8 @@ void RtspPublishServer::handle_client(int client_fd) {
                 }
                 receiving.store(true);
                 video_receiver = std::thread([&, local_rtp_fd = video_rtp_fd]() {
-                    H264RtpIngest ingest(registry_, stream_key, sets);
+                    VideoRtpIngest ingest(
+                        registry_, stream_key, sets, video_codec, video_frame_interval_ms);
                     std::array<std::uint8_t, 2048> packet{};
                     while (receiving.load()) {
                         const auto received = ::recv(local_rtp_fd, packet.data(), packet.size(), 0);

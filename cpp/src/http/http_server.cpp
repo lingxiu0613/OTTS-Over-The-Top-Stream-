@@ -920,7 +920,8 @@ std::string HttpServer::build_streams_json() const {
         body << "\"last_keyframe_at_epoch_ms\":" << stream.last_keyframe_at_epoch_ms << ",";
         body << "\"first_media_at_epoch_ms\":" << stream.first_media_at_epoch_ms << ",";
         body << "\"last_media_at_epoch_ms\":" << stream.last_media_at_epoch_ms << ",";
-        body << "\"last_media_age_ms\":" << stream.last_media_age_ms;
+        body << "\"last_media_age_ms\":" << stream.last_media_age_ms << ",";
+        body << "\"publish_generation\":" << stream.publish_generation;
         {
             std::lock_guard<std::mutex> stats_lock(flv_stats_mutex_);
             const auto stats_it = flv_stats_.find(stream.stream_key);

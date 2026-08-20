@@ -1,6 +1,7 @@
 build/
 build-*/
 build-native*/
+dist/
 
 node/node_modules/
 node/certs/*.key

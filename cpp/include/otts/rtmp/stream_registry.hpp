@@ -62,6 +62,7 @@ public:
         std::uint64_t first_media_at_epoch_ms{0};
         std::uint64_t last_media_at_epoch_ms{0};
         std::uint64_t last_media_age_ms{0};
+        std::uint64_t publish_generation{0};
     };
 
     struct RtspDescribeInfo {
@@ -121,6 +122,10 @@ public:
         otts::media::StreamSource source,
         const std::string& managed_by,
         const MediaMessage& message);
+    void begin_external_publish(
+        const std::string& stream_key,
+        otts::media::StreamSource source,
+        const std::string& managed_by);
     void upsert_external_stream(
         const std::string& stream_key,
         otts::media::StreamSource source,
@@ -214,6 +219,7 @@ private:
         std::uint64_t last_keyframe_at_epoch_ms{0};
         std::uint64_t first_media_at_epoch_ms{0};
         std::uint64_t last_media_at_epoch_ms{0};
+        std::uint64_t publish_generation{0};
     };
 
     struct ExternalSessionState {

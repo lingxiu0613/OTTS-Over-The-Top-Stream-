@@ -1,5 +1,7 @@
 #include "otts/rtmp/stream_registry.hpp"
 
+#include "otts/codec/video_codec.hpp"
+
 #include "otts/core/logger.hpp"
 #include "otts/rtmp/rtmp_session.hpp"
 
@@ -104,6 +106,7 @@ void StreamRegistry::register_publisher(const std::string& stream_key, const std
         stream.last_keyframe_at_epoch_ms = 0;
         stream.first_media_at_epoch_ms = 0;
         stream.last_media_at_epoch_ms = 0;
+        stream.publish_generation += 1;
         otts::core::log_info("stream_registry", "registered publisher key=" + stream_key);
         persist_state_locked();
     }
@@ -112,6 +115,36 @@ void StreamRegistry::register_publisher(const std::string& stream_key, const std
         otts::core::log_warn("stream_registry", "replacing duplicate publisher key=" + stream_key);
         previous_publisher->stop();
     }
+}
+
+void StreamRegistry::begin_external_publish(
+    const std::string& stream_key,
+    otts::media::StreamSource source,
+    const std::string& managed_by) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto& stream = streams_[stream_key];
+    stream.source = source;
+    stream.ingest_origin = source;
+    stream.managed_by = managed_by;
+    stream.external_publisher_active = true;
+    stream.metadata.reset();
+    stream.audio_sequence_header.reset();
+    stream.video_sequence_header.reset();
+    stream.audio_track = {};
+    stream.video_track = {};
+    stream.audio_track.kind = otts::media::MediaKind::Audio;
+    stream.video_track.kind = otts::media::MediaKind::Video;
+    stream.gop_cache = {};
+    stream.total_packets = stream.total_bytes = 0;
+    stream.audio_packets = stream.audio_bytes = 0;
+    stream.video_packets = stream.video_bytes = 0;
+    stream.data_packets = stream.data_bytes = 0;
+    stream.last_media_timestamp = 0;
+    stream.last_keyframe_at_epoch_ms = 0;
+    stream.first_media_at_epoch_ms = 0;
+    stream.last_media_at_epoch_ms = 0;
+    stream.publish_generation += 1;
+    persist_state_locked();
 }
 
 void StreamRegistry::unregister_publisher(const std::shared_ptr<RtmpSession>& session) {
@@ -492,6 +525,7 @@ std::vector<StreamRegistry::StreamSnapshot> StreamRegistry::snapshots() const {
         if (state.last_media_at_epoch_ms > 0 && now_ms >= state.last_media_at_epoch_ms) {
             snapshot.last_media_age_ms = now_ms - state.last_media_at_epoch_ms;
         }
+        snapshot.publish_generation = state.publish_generation;
         result.push_back(std::move(snapshot));
     }
 
@@ -632,63 +666,30 @@ std::optional<StreamRegistry::RtspDescribeInfo> StreamRegistry::rtsp_describe_in
     }
 
     const auto& payload = it->second.video_sequence_header->payload;
-    if (payload.size() < 13 || payload[1] != 0) {
+    const auto video = otts::codec::parse_flv_video_packet(payload);
+    if (!video || !video->sequence_header || video->data_offset >= payload.size()) {
         return std::nullopt;
     }
-
-    std::size_t offset = 5;
-    if (offset + 6 > payload.size()) {
+    const std::vector<std::uint8_t> config(
+        payload.begin() + static_cast<std::ptrdiff_t>(video->data_offset), payload.end());
+    const auto sets = otts::codec::parse_decoder_config(video->codec, config);
+    if (!sets.complete(video->codec)) {
         return std::nullopt;
     }
 
     RtspDescribeInfo info;
     info.stream_key = stream_key;
-    info.video_codec = "h264";
-
-    std::ostringstream profile;
-    profile << std::hex;
-    profile.width(2);
-    profile.fill('0');
-    profile << static_cast<int>(payload[offset + 1]);
-    profile.width(2);
-    profile << static_cast<int>(payload[offset + 2]);
-    profile.width(2);
-    profile << static_cast<int>(payload[offset + 3]);
-    info.profile_level_id = profile.str();
-
-    const auto sps_count = static_cast<std::uint8_t>(payload[offset + 5] & 0x1F);
-    offset += 6;
-    if (sps_count == 0 || offset + 2 > payload.size()) {
-        return std::nullopt;
+    info.video_codec = otts::media::to_string(video->codec);
+    if (video->codec == otts::media::CodecId::Avc && config.size() >= 4) {
+        std::ostringstream profile;
+        profile << std::hex << std::setfill('0') << std::setw(2) << static_cast<int>(config[1])
+                << std::setw(2) << static_cast<int>(config[2]) << std::setw(2) << static_cast<int>(config[3]);
+        info.profile_level_id = profile.str();
+        info.sprop_parameter_sets = base64_encode(sets.sps) + "," + base64_encode(sets.pps);
+    } else if (video->codec == otts::media::CodecId::Hevc) {
+        info.sprop_parameter_sets =
+            base64_encode(sets.vps) + "," + base64_encode(sets.sps) + "," + base64_encode(sets.pps);
     }
-
-    const auto sps_length = static_cast<std::size_t>((payload[offset] << 8) | payload[offset + 1]);
-    offset += 2;
-    if (offset + sps_length > payload.size()) {
-        return std::nullopt;
-    }
-    std::vector<std::uint8_t> sps(payload.begin() + static_cast<std::ptrdiff_t>(offset),
-                                  payload.begin() + static_cast<std::ptrdiff_t>(offset + sps_length));
-    offset += sps_length;
-
-    if (offset + 1 > payload.size()) {
-        return std::nullopt;
-    }
-    const auto pps_count = payload[offset];
-    offset += 1;
-    if (pps_count == 0 || offset + 2 > payload.size()) {
-        return std::nullopt;
-    }
-
-    const auto pps_length = static_cast<std::size_t>((payload[offset] << 8) | payload[offset + 1]);
-    offset += 2;
-    if (offset + pps_length > payload.size()) {
-        return std::nullopt;
-    }
-    std::vector<std::uint8_t> pps(payload.begin() + static_cast<std::ptrdiff_t>(offset),
-                                  payload.begin() + static_cast<std::ptrdiff_t>(offset + pps_length));
-
-    info.sprop_parameter_sets = base64_encode(sps) + "," + base64_encode(pps);
 
     if (it->second.audio_sequence_header.has_value()) {
         const auto& audio_payload = it->second.audio_sequence_header->payload;
@@ -777,6 +778,11 @@ void StreamRegistry::publish_media_locked(
         stream.video_track.bytes += payload_size;
         if (packet.is_sequence_header) {
             stream.video_track.has_sequence_header = true;
+            const auto annexb = otts::codec::flv_video_config_to_annexb(message.payload);
+            const auto sets = otts::codec::extract_parameter_sets(annexb, packet.codec);
+            stream.video_track.has_vps = !sets.vps.empty();
+            stream.video_track.has_sps = !sets.sps.empty();
+            stream.video_track.has_pps = !sets.pps.empty();
         }
         if (packet.is_keyframe) {
             stream.last_keyframe_at_epoch_ms = now_ms;
@@ -983,8 +989,11 @@ std::string StreamRegistry::json_escape(std::string_view value) {
 }
 
 bool StreamRegistry::is_video_sequence_header(const MediaMessage& message) {
-    return message.type_id == 9 && message.payload.size() >= 2 && (message.payload[0] & 0x0F) == 7 &&
-           message.payload[1] == 0;
+    if (message.type_id != 9) {
+        return false;
+    }
+    const auto video = otts::codec::parse_flv_video_packet(message.payload);
+    return video && video->sequence_header;
 }
 
 bool StreamRegistry::is_audio_sequence_header(const MediaMessage& message) {
@@ -993,12 +1002,18 @@ bool StreamRegistry::is_audio_sequence_header(const MediaMessage& message) {
 }
 
 bool StreamRegistry::is_video_keyframe(const MediaMessage& message) {
-    return message.type_id == 9 && !message.payload.empty() && ((message.payload[0] >> 4) & 0x0F) == 1;
+    if (message.type_id != 9) {
+        return false;
+    }
+    const auto video = otts::codec::parse_flv_video_packet(message.payload);
+    return video && video->keyframe && video->coded_frames;
 }
 
 otts::media::MediaPacket StreamRegistry::to_media_packet(const MediaMessage& message) {
     otts::media::MediaPacket packet;
     packet.timestamp_ms = message.timestamp;
+    packet.dts_ms = message.timestamp;
+    packet.pts_ms = message.timestamp;
     packet.message_stream_id = message.message_stream_id;
     packet.payload = message.payload;
 
@@ -1023,15 +1038,12 @@ otts::media::MediaPacket StreamRegistry::to_media_packet(const MediaMessage& mes
 
     if (message.type_id == 9) {
         packet.kind = otts::media::MediaKind::Video;
-        packet.is_sequence_header = is_video_sequence_header(message);
-        packet.is_keyframe = is_video_keyframe(message);
-        if (!message.payload.empty()) {
-            const auto codec_id = static_cast<std::uint8_t>(message.payload[0] & 0x0F);
-            if (codec_id == 7) {
-                packet.codec = otts::media::CodecId::Avc;
-            } else if (codec_id == 12) {
-                packet.codec = otts::media::CodecId::Hevc;
-            }
+        const auto video = otts::codec::parse_flv_video_packet(message.payload);
+        if (video) {
+            packet.codec = video->codec;
+            packet.is_sequence_header = video->sequence_header;
+            packet.is_keyframe = video->keyframe && video->coded_frames;
+            packet.pts_ms = static_cast<std::int64_t>(message.timestamp) + video->composition_time_ms;
         }
         return packet;
     }

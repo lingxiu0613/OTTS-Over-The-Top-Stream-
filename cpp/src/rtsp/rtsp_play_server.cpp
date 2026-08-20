@@ -2,6 +2,7 @@
 #include "otts/rtsp/rtsp_play_server.hpp"
 
 #include "otts/auth/stream_auth.hpp"
+#include "otts/codec/video_codec.hpp"
 
 #include "otts/core/logger.hpp"
 
@@ -88,13 +89,6 @@ bool send_all(int fd, std::string_view data) {
 }
 
 
-std::uint32_t read_be32(const std::uint8_t* data) {
-    return (static_cast<std::uint32_t>(data[0]) << 24) |
-           (static_cast<std::uint32_t>(data[1]) << 16) |
-           (static_cast<std::uint32_t>(data[2]) << 8) |
-           static_cast<std::uint32_t>(data[3]);
-}
-
 void write_be16(std::vector<std::uint8_t>& out, std::uint16_t value) {
     out.push_back(static_cast<std::uint8_t>((value >> 8) & 0xff));
     out.push_back(static_cast<std::uint8_t>(value & 0xff));
@@ -105,17 +99,6 @@ void write_be32(std::vector<std::uint8_t>& out, std::uint32_t value) {
     out.push_back(static_cast<std::uint8_t>((value >> 16) & 0xff));
     out.push_back(static_cast<std::uint8_t>((value >> 8) & 0xff));
     out.push_back(static_cast<std::uint8_t>(value & 0xff));
-}
-
-std::int32_t read_signed_be24(const std::uint8_t* data) {
-    std::int32_t value =
-        (static_cast<std::int32_t>(data[0]) << 16) |
-        (static_cast<std::int32_t>(data[1]) << 8) |
-        static_cast<std::int32_t>(data[2]);
-    if ((value & 0x00800000) != 0) {
-        value |= ~0x00ffffff;
-    }
-    return value;
 }
 
 std::string stream_key_from_uri(std::string uri) {
@@ -299,26 +282,32 @@ public:
         if ((!use_tcp_ && socket_fd_ < 0) || message.type_id != 9 || message.payload.size() < 5) {
             return;
         }
-        const auto frame_codec = message.payload[0];
-        const auto codec_id = frame_codec & 0x0f;
-        const auto avc_packet_type = message.payload[1];
-        if (codec_id != 7 || avc_packet_type != 1) {
+        const auto video = otts::codec::parse_flv_video_packet(message.payload);
+        if (!video || !video->coded_frames) {
             return;
         }
-        const auto composition_time_ms = read_signed_be24(message.payload.data() + 2);
-        const auto present_time_ms = static_cast<std::int64_t>(message.timestamp) + static_cast<std::int64_t>(composition_time_ms);
+        const auto present_time_ms = static_cast<std::int64_t>(message.timestamp) + video->composition_time_ms;
         const auto normalized_present_time_ms = static_cast<std::uint32_t>(std::max<std::int64_t>(0, present_time_ms));
-        const auto rtp_timestamp = next_media_rtp_timestamp(normalized_present_time_ms, 33);
-        std::size_t cursor = 5;
-        while (cursor + 4 <= message.payload.size()) {
-            const auto nal_size = read_be32(message.payload.data() + cursor);
-            cursor += 4;
-            if (nal_size == 0 || cursor + nal_size > message.payload.size()) {
-                break;
-            }
-            const bool last_nal = (cursor + nal_size) >= message.payload.size();
-            send_nal(message.payload.data() + cursor, nal_size, rtp_timestamp, last_nal);
-            cursor += nal_size;
+        // RTP video timestamps represent presentation time. Do not synthesize a
+        // fixed frame delta here: B-frame decode order makes PTS non-monotonic,
+        // and replacing those values changes 25 fps input into roughly 30 fps.
+        const auto rtp_timestamp = static_cast<std::uint32_t>(
+            (static_cast<std::uint64_t>(normalized_present_time_ms) * clock_rate_) / 1000);
+        const auto annexb = otts::codec::flv_video_sample_to_annexb(message.payload);
+        std::size_t cursor = 0;
+        while (cursor + 3 < annexb.size()) {
+            std::size_t code = 0;
+            if (annexb[cursor] == 0 && annexb[cursor + 1] == 0 && annexb[cursor + 2] == 1) code = 3;
+            else if (annexb[cursor] == 0 && annexb[cursor + 1] == 0 && annexb[cursor + 2] == 0 && annexb[cursor + 3] == 1) code = 4;
+            if (code == 0) { ++cursor; continue; }
+            const auto begin = cursor + code;
+            auto end = begin;
+            while (end + 3 < annexb.size() &&
+                   !(annexb[end] == 0 && annexb[end + 1] == 0 &&
+                     (annexb[end + 2] == 1 || (annexb[end + 2] == 0 && annexb[end + 3] == 1)))) ++end;
+            if (end + 3 >= annexb.size()) end = annexb.size();
+            if (end > begin) send_nal(annexb.data() + begin, end - begin, rtp_timestamp, end == annexb.size(), video->codec);
+            cursor = end;
         }
     }
 
@@ -359,27 +348,6 @@ private:
         return *rtp_timestamp_accumulator_;
     }
 
-    std::uint32_t next_media_rtp_timestamp(std::uint32_t input_timestamp_ms, std::uint32_t default_delta_ms) {
-        if (!last_input_timestamp_ms_.has_value()) {
-            last_input_timestamp_ms_ = input_timestamp_ms;
-            rtp_timestamp_accumulator_ = static_cast<std::uint32_t>(
-                (static_cast<std::uint64_t>(input_timestamp_ms) * clock_rate_) / 1000);
-            return *rtp_timestamp_accumulator_;
-        }
-
-        std::uint32_t delta_ms = default_delta_ms;
-        if (input_timestamp_ms > *last_input_timestamp_ms_) {
-            const auto observed = input_timestamp_ms - *last_input_timestamp_ms_;
-            if (observed >= 10 && observed <= 50) {
-                delta_ms = observed;
-            }
-        }
-        last_input_timestamp_ms_ = input_timestamp_ms;
-        rtp_timestamp_accumulator_ = *rtp_timestamp_accumulator_ +
-                                     static_cast<std::uint32_t>((static_cast<std::uint64_t>(delta_ms) * clock_rate_) / 1000);
-        return *rtp_timestamp_accumulator_;
-    }
-
     void send_packet(const std::uint8_t* payload, std::size_t size, std::uint32_t timestamp, bool marker) {
         std::vector<std::uint8_t> packet;
         packet.reserve(12 + size);
@@ -414,10 +382,36 @@ private:
         ::sendto(socket_fd_, packet.data(), packet.size(), MSG_NOSIGNAL, reinterpret_cast<sockaddr*>(&remote_), sizeof(remote_));
     }
 
-    void send_nal(const std::uint8_t* nal, std::size_t size, std::uint32_t timestamp, bool marker) {
+    void send_nal(
+        const std::uint8_t* nal,
+        std::size_t size,
+        std::uint32_t timestamp,
+        bool marker,
+        otts::media::CodecId codec) {
         constexpr std::size_t max_payload = 1200;
         if (size <= max_payload) {
             send_packet(nal, size, timestamp, marker);
+            return;
+        }
+        if (codec == otts::media::CodecId::Hevc) {
+            if (size < 3) return;
+            const auto nal_type = static_cast<std::uint8_t>((nal[0] >> 1) & 0x3f);
+            const std::array<std::uint8_t, 2> fu_indicator{
+                static_cast<std::uint8_t>((nal[0] & 0x81) | (49 << 1)), nal[1]};
+            std::size_t offset = 2;
+            bool start = true;
+            while (offset < size) {
+                const auto chunk = std::min<std::size_t>(size - offset, max_payload - 3);
+                const bool end = offset + chunk >= size;
+                std::array<std::uint8_t, max_payload> payload{};
+                payload[0] = fu_indicator[0];
+                payload[1] = fu_indicator[1];
+                payload[2] = static_cast<std::uint8_t>((start ? 0x80 : 0) | (end ? 0x40 : 0) | nal_type);
+                std::memcpy(payload.data() + 3, nal + offset, chunk);
+                send_packet(payload.data(), chunk + 3, timestamp, end && marker);
+                start = false;
+                offset += chunk;
+            }
             return;
         }
         const auto nal_header = nal[0];
@@ -562,7 +556,10 @@ void RtspPlayServer::handle_client(int client_fd) {
                     }
                     std::size_t queued_video_messages = 0;
                     for (const auto& queued : pending_messages) {
-                        if (queued.type_id == 9 && queued.payload.size() > 1 && queued.payload[1] == 1) {
+                        const auto video = queued.type_id == 9
+                            ? otts::codec::parse_flv_video_packet(queued.payload)
+                            : std::nullopt;
+                        if (video && video->coded_frames) {
                             ++queued_video_messages;
                         }
                     }
@@ -581,7 +578,10 @@ void RtspPlayServer::handle_client(int client_fd) {
                 pending_messages.erase(next);
             }
 
-            const bool is_raw_video = message.type_id == 9 && message.payload.size() > 1 && message.payload[1] == 1;
+            const auto video = message.type_id == 9
+                ? otts::codec::parse_flv_video_packet(message.payload)
+                : std::nullopt;
+            const bool is_raw_video = video && video->coded_frames;
             const bool is_raw_audio = message.type_id == 8 && message.payload.size() > 1 && message.payload[1] == 1;
             if (is_raw_video || is_raw_audio) {
                 auto now = std::chrono::steady_clock::now();
@@ -704,9 +704,20 @@ void RtspPlayServer::handle_client(int client_fd) {
                 sdp << "t=0 0\r\n";
                 sdp << "m=video 0 RTP/AVP 96\r\n";
                 sdp << "a=control:trackID=0\r\n";
-                sdp << "a=rtpmap:96 H264/90000\r\n";
-                sdp << "a=fmtp:96 packetization-mode=1;profile-level-id=" << info->profile_level_id
-                    << ";sprop-parameter-sets=" << info->sprop_parameter_sets << "\r\n";
+                if (info->video_codec == "h265") {
+                    std::istringstream values(info->sprop_parameter_sets);
+                    std::string vps, sps_value, pps;
+                    std::getline(values, vps, ',');
+                    std::getline(values, sps_value, ',');
+                    std::getline(values, pps, ',');
+                    sdp << "a=rtpmap:96 H265/90000\r\n";
+                    sdp << "a=fmtp:96 sprop-vps=" << vps << ";sprop-sps=" << sps_value
+                        << ";sprop-pps=" << pps << "\r\n";
+                } else {
+                    sdp << "a=rtpmap:96 H264/90000\r\n";
+                    sdp << "a=fmtp:96 packetization-mode=1;profile-level-id=" << info->profile_level_id
+                        << ";sprop-parameter-sets=" << info->sprop_parameter_sets << "\r\n";
+                }
                 if (info->has_audio) {
                     sdp << "m=audio 0 RTP/AVP 97\r\n";
                     sdp << "a=control:trackID=1\r\n";

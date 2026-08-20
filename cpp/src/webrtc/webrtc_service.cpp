@@ -1,8 +1,10 @@
 #include "otts/webrtc/webrtc_service.hpp"
 
+#include "otts/codec/video_codec.hpp"
 #include "otts/core/logger.hpp"
 #include "otts/rtmp/stream_registry.hpp"
 #include "otts/webrtc/audio_transcoder.hpp"
+#include "otts/webrtc/video_transcoder.hpp"
 
 #include <algorithm>
 #include <deque>
@@ -46,26 +48,13 @@ std::string state_to_string(SessionState state) {
     return "unknown";
 }
 
-void write_be16(std::vector<std::uint8_t>& out, std::uint16_t value) {
-    out.push_back(static_cast<std::uint8_t>((value >> 8) & 0xff));
-    out.push_back(static_cast<std::uint8_t>(value & 0xff));
-}
-
-void write_be32(std::vector<std::uint8_t>& out, std::uint32_t value) {
-    out.push_back(static_cast<std::uint8_t>((value >> 24) & 0xff));
-    out.push_back(static_cast<std::uint8_t>((value >> 16) & 0xff));
-    out.push_back(static_cast<std::uint8_t>((value >> 8) & 0xff));
-    out.push_back(static_cast<std::uint8_t>(value & 0xff));
-}
-
-struct NalSets {
-    std::vector<std::uint8_t> sps;
-    std::vector<std::uint8_t> pps;
-};
-
 struct WebRtcPayloadTypes {
     std::uint8_t h264{102};
+    std::uint8_t h265{104};
     std::uint8_t opus{111};
+    bool has_h264{false};
+    bool has_h265{false};
+    otts::media::CodecId preferred_video_codec{otts::media::CodecId::Unknown};
     std::string video_mid{"video"};
     std::string audio_mid{"audio"};
 };
@@ -81,6 +70,7 @@ WebRtcPayloadTypes parse_offer_payload_types(const std::string& offer_sdp) {
     WebRtcPayloadTypes types;
     std::unordered_map<int, std::string> codecs;
     std::unordered_map<int, std::string> fmtps;
+    std::vector<int> video_payload_order;
     std::istringstream input(offer_sdp);
     std::string line;
     std::string current_media;
@@ -91,6 +81,15 @@ WebRtcPayloadTypes parse_offer_payload_types(const std::string& offer_sdp) {
         if (line.rfind("m=", 0) == 0) {
             if (line.rfind("m=video ", 0) == 0) {
                 current_media = "video";
+                std::istringstream media(line);
+                std::string token;
+                for (int field = 0; media >> token; ++field) {
+                    if (field < 3) continue;
+                    try {
+                        video_payload_order.push_back(std::stoi(token));
+                    } catch (...) {
+                    }
+                }
             } else if (line.rfind("m=audio ", 0) == 0) {
                 current_media = "audio";
             } else {
@@ -142,8 +141,24 @@ WebRtcPayloadTypes parse_offer_payload_types(const std::string& offer_sdp) {
             if (!found_h264 || (supports_packetization_mode_one && fmtp != fmtps.end() &&
                                 fmtp->second.find("profile-level-id=42e01f") != std::string::npos)) {
                 types.h264 = static_cast<std::uint8_t>(pt);
+                types.has_h264 = true;
                 found_h264 = true;
             }
+        } else if ((codec == "H265" || codec == "HEVC") && pt >= 0 && pt <= 255) {
+            types.h265 = static_cast<std::uint8_t>(pt);
+            types.has_h265 = true;
+        }
+    }
+    for (const auto pt : video_payload_order) {
+        const auto codec = codecs.find(pt);
+        if (codec == codecs.end()) continue;
+        if ((codec->second == "H265" || codec->second == "HEVC") && types.has_h265) {
+            types.preferred_video_codec = otts::media::CodecId::Hevc;
+            break;
+        }
+        if (codec->second == "H264" && types.has_h264) {
+            types.preferred_video_codec = otts::media::CodecId::Avc;
+            break;
         }
     }
     return types;
@@ -170,141 +185,6 @@ std::vector<std::byte> rtc_binary_from_bytes(
         out.push_back(static_cast<std::byte>(data[i]));
     }
     return out;
-}
-
-std::optional<std::pair<std::size_t, std::size_t>> start_code_at(
-    const std::vector<std::uint8_t>& data,
-    std::size_t pos) {
-    if (pos + 3 <= data.size() && data[pos] == 0 && data[pos + 1] == 0 && data[pos + 2] == 1) {
-        return std::make_pair(pos, std::size_t{3});
-    }
-    if (pos + 4 <= data.size() && data[pos] == 0 && data[pos + 1] == 0 && data[pos + 2] == 0 && data[pos + 3] == 1) {
-        return std::make_pair(pos, std::size_t{4});
-    }
-    return std::nullopt;
-}
-
-NalSets extract_parameter_sets_from_annexb(const std::vector<std::uint8_t>& annexb) {
-    NalSets sets;
-    std::size_t i = 0;
-    while (i < annexb.size()) {
-        const auto code = start_code_at(annexb, i);
-        if (!code) {
-            ++i;
-            continue;
-        }
-        const auto nal_start = code->first + code->second;
-        auto nal_end = nal_start;
-        while (nal_end < annexb.size() && !start_code_at(annexb, nal_end)) {
-            ++nal_end;
-        }
-        if (nal_end > nal_start) {
-            const auto nal_type = annexb[nal_start] & 0x1f;
-            if (nal_type == 7) {
-                sets.sps.assign(annexb.begin() + static_cast<std::ptrdiff_t>(nal_start), annexb.begin() + static_cast<std::ptrdiff_t>(nal_end));
-            } else if (nal_type == 8) {
-                sets.pps.assign(annexb.begin() + static_cast<std::ptrdiff_t>(nal_start), annexb.begin() + static_cast<std::ptrdiff_t>(nal_end));
-            }
-        }
-        i = nal_end;
-    }
-    return sets;
-}
-
-bool annexb_has_idr(const std::vector<std::uint8_t>& annexb) {
-    std::size_t i = 0;
-    while (i < annexb.size()) {
-        const auto code = start_code_at(annexb, i);
-        if (!code) {
-            ++i;
-            continue;
-        }
-        const auto nal = code->first + code->second;
-        if (nal < annexb.size() && (annexb[nal] & 0x1f) == 5) {
-            return true;
-        }
-        i = nal + 1;
-    }
-    return false;
-}
-
-std::vector<std::uint8_t> annexb_to_avcc(const std::vector<std::uint8_t>& annexb) {
-    std::vector<std::uint8_t> out;
-    std::size_t i = 0;
-    while (i < annexb.size()) {
-        const auto code = start_code_at(annexb, i);
-        if (!code) {
-            ++i;
-            continue;
-        }
-        const auto nal_start = code->first + code->second;
-        auto nal_end = nal_start;
-        while (nal_end < annexb.size() && !start_code_at(annexb, nal_end)) {
-            ++nal_end;
-        }
-        const auto nal_size = nal_end - nal_start;
-        if (nal_size > 0) {
-            write_be32(out, static_cast<std::uint32_t>(nal_size));
-            out.insert(out.end(), annexb.begin() + static_cast<std::ptrdiff_t>(nal_start), annexb.begin() + static_cast<std::ptrdiff_t>(nal_end));
-        }
-        i = nal_end;
-    }
-    return out;
-}
-
-std::vector<std::uint8_t> avcc_to_annexb(const std::vector<std::uint8_t>& avcc) {
-    std::vector<std::uint8_t> out;
-    std::size_t offset = 0;
-    while (offset + 4 <= avcc.size()) {
-        const auto nal_size =
-            (static_cast<std::uint32_t>(avcc[offset]) << 24) |
-            (static_cast<std::uint32_t>(avcc[offset + 1]) << 16) |
-            (static_cast<std::uint32_t>(avcc[offset + 2]) << 8) |
-            static_cast<std::uint32_t>(avcc[offset + 3]);
-        offset += 4;
-        if (nal_size == 0 || offset + nal_size > avcc.size()) {
-            break;
-        }
-        out.insert(out.end(), {0x00, 0x00, 0x00, 0x01});
-        out.insert(
-            out.end(),
-            avcc.begin() + static_cast<std::ptrdiff_t>(offset),
-            avcc.begin() + static_cast<std::ptrdiff_t>(offset + nal_size));
-        offset += nal_size;
-    }
-    return out;
-}
-
-otts::rtmp::MediaMessage make_avc_sequence_header(std::uint32_t timestamp, const NalSets& sets) {
-    otts::rtmp::MediaMessage message;
-    message.timestamp = timestamp;
-    message.type_id = 9;
-    message.message_stream_id = 1;
-    message.payload = {0x17, 0x00, 0x00, 0x00, 0x00};
-    message.payload.push_back(0x01);
-    message.payload.push_back(sets.sps.size() > 1 ? sets.sps[1] : 0x64);
-    message.payload.push_back(sets.sps.size() > 2 ? sets.sps[2] : 0x00);
-    message.payload.push_back(sets.sps.size() > 3 ? sets.sps[3] : 0x1f);
-    message.payload.push_back(0xff);
-    message.payload.push_back(0xe1);
-    write_be16(message.payload, static_cast<std::uint16_t>(sets.sps.size()));
-    message.payload.insert(message.payload.end(), sets.sps.begin(), sets.sps.end());
-    message.payload.push_back(0x01);
-    write_be16(message.payload, static_cast<std::uint16_t>(sets.pps.size()));
-    message.payload.insert(message.payload.end(), sets.pps.begin(), sets.pps.end());
-    return message;
-}
-
-otts::rtmp::MediaMessage make_avc_nalu_message(std::uint32_t timestamp, const std::vector<std::uint8_t>& annexb) {
-    otts::rtmp::MediaMessage message;
-    message.timestamp = timestamp;
-    message.type_id = 9;
-    message.message_stream_id = 1;
-    message.payload.push_back(static_cast<std::uint8_t>((annexb_has_idr(annexb) ? 0x10 : 0x20) | 0x07));
-    message.payload.insert(message.payload.end(), {0x01, 0x00, 0x00, 0x00});
-    auto avcc = annexb_to_avcc(annexb);
-    message.payload.insert(message.payload.end(), avcc.begin(), avcc.end());
-    return message;
 }
 
 otts::rtmp::MediaMessage make_aac_audio_message(
@@ -336,60 +216,6 @@ std::vector<std::uint8_t> aac_audio_payload(
         return {};
     }
     return std::vector<std::uint8_t>(payload.begin() + 2, payload.end());
-}
-
-std::uint32_t avc_presentation_timestamp(const otts::rtmp::MediaMessage& message) {
-    if (message.payload.size() < 5 || message.type_id != 9 || message.payload[1] != 1) {
-        return message.timestamp;
-    }
-    std::int32_t composition_time =
-        (static_cast<std::int32_t>(message.payload[2]) << 16) |
-        (static_cast<std::int32_t>(message.payload[3]) << 8) |
-        static_cast<std::int32_t>(message.payload[4]);
-    if ((composition_time & 0x00800000) != 0) {
-        composition_time |= static_cast<std::int32_t>(0xff000000);
-    }
-    const auto presentation_time =
-        static_cast<std::int64_t>(message.timestamp) + composition_time;
-    return static_cast<std::uint32_t>(std::max<std::int64_t>(0, presentation_time));
-}
-
-std::vector<std::uint8_t> avc_sequence_to_sample(const std::vector<std::uint8_t>& payload) {
-    std::vector<std::uint8_t> out;
-    if (payload.size() < 13 || payload[1] != 0) {
-        return out;
-    }
-    std::size_t offset = 5;
-    if (offset + 6 > payload.size()) {
-        return out;
-    }
-    const auto sps_count = static_cast<std::uint8_t>(payload[offset + 5] & 0x1f);
-    offset += 6;
-    for (std::uint8_t i = 0; i < sps_count && offset + 2 <= payload.size(); ++i) {
-        const auto size = static_cast<std::size_t>((payload[offset] << 8) | payload[offset + 1]);
-        offset += 2;
-        if (offset + size > payload.size()) {
-            return out;
-        }
-        write_be32(out, static_cast<std::uint32_t>(size));
-        out.insert(out.end(), payload.begin() + static_cast<std::ptrdiff_t>(offset), payload.begin() + static_cast<std::ptrdiff_t>(offset + size));
-        offset += size;
-    }
-    if (offset >= payload.size()) {
-        return out;
-    }
-    const auto pps_count = payload[offset++];
-    for (std::uint8_t i = 0; i < pps_count && offset + 2 <= payload.size(); ++i) {
-        const auto size = static_cast<std::size_t>((payload[offset] << 8) | payload[offset + 1]);
-        offset += 2;
-        if (offset + size > payload.size()) {
-            return out;
-        }
-        write_be32(out, static_cast<std::uint32_t>(size));
-        out.insert(out.end(), payload.begin() + static_cast<std::ptrdiff_t>(offset), payload.begin() + static_cast<std::ptrdiff_t>(offset + size));
-        offset += size;
-    }
-    return out;
 }
 
 #if OTTS_WEBRTC_DATACHANNEL
@@ -488,7 +314,7 @@ void upsert_native_protocol_session(
         "",
         "",
         "webrtc/ice-dtls-srtp",
-        direction == SessionDirection::Publish ? "native-whip-h264-ingress" : "native-whep-h264-egress",
+        direction == SessionDirection::Publish ? "native-whip-video-ingress" : "native-whep-video-egress",
         native_stage,
         codec_hint,
         0,
@@ -520,6 +346,8 @@ struct WebRtcService::NativeSession {
     std::mutex media_mutex;
     std::mutex audio_codec_mutex;
     std::vector<std::uint8_t> video_config_sample;
+    otts::media::CodecId video_codec{otts::media::CodecId::Avc};
+    otts::media::CodecId source_video_codec{otts::media::CodecId::Avc};
     std::uint64_t started_at_epoch_ms{0};
 #if OTTS_WEBRTC_DATACHANNEL
     std::shared_ptr<rtc::PeerConnection> pc;
@@ -529,6 +357,7 @@ struct WebRtcService::NativeSession {
     std::shared_ptr<rtc::RtcpSrReporter> audio_sr_reporter;
     std::unique_ptr<AudioTranscoder> opus_to_aac;
     std::unique_ptr<AudioTranscoder> aac_to_opus;
+    std::unique_ptr<VideoTranscoder> hevc_to_avc;
     std::vector<std::uint8_t> aac_config;
     bool aac_sequence_published{false};
     bool audio_transcode_error_logged{false};
@@ -652,29 +481,59 @@ struct WebRtcService::NativeSession {
     }
 
     void send_video_to_webrtc(const otts::rtmp::MediaMessage& message, const std::string& context) {
-        if (message.type_id != 9 || message.payload.size() < 5 || (message.payload[0] & 0x0f) != 7) {
+        if (message.type_id != 9) {
             return;
         }
+        const auto packet = otts::codec::parse_flv_video_packet(message.payload);
+        if (!packet || packet->codec != source_video_codec) return;
         std::vector<std::uint8_t> sample;
         bool is_video_keyframe = false;
-        if (message.payload[1] == 0) {
-            sample = avc_sequence_to_sample(message.payload);
+        if (packet->sequence_header) {
+            sample = otts::codec::flv_video_config_to_annexb(message.payload);
             if (!sample.empty()) {
                 std::lock_guard<std::mutex> lock(media_mutex);
                 video_config_sample = sample;
             }
-            // AVCDecoderConfigurationRecord contains SPS/PPS but no picture.
-            // Cache it and prepend it to the next IDR instead of emitting an
-            // empty video frame into the browser decoder.
             return;
-        } else if (message.payload[1] == 1) {
-            sample.assign(message.payload.begin() + 5, message.payload.end());
-            is_video_keyframe = ((message.payload[0] >> 4) & 0x0f) == 1 ||
-                annexb_has_idr(avcc_to_annexb(sample));
+        } else if (packet->coded_frames) {
+            sample = otts::codec::flv_video_sample_to_annexb(message.payload);
+            is_video_keyframe = packet->keyframe || otts::codec::is_keyframe(sample, video_codec);
         } else {
             return;
         }
         if (!video_track || !video_track_open.load()) {
+            return;
+        }
+        if (source_video_codec == otts::media::CodecId::Hevc && video_codec == otts::media::CodecId::Avc) {
+            if (!is_video_keyframe && !video_keyframe_seen.load()) {
+                return;
+            }
+            if (is_video_keyframe) {
+                std::lock_guard<std::mutex> lock(media_mutex);
+                if (!video_config_sample.empty()) {
+                    auto configured = video_config_sample;
+                    configured.insert(configured.end(), sample.begin(), sample.end());
+                    sample = std::move(configured);
+                }
+                video_keyframe_seen.store(true);
+            }
+            if (!hevc_to_avc) {
+                std::string error;
+                hevc_to_avc = VideoTranscoder::create_hevc_to_avc(error);
+                if (!hevc_to_avc) {
+                    otts::core::log_warn("webrtc_native", context + " HEVC-to-AVC init failed: " + error);
+                    return;
+                }
+                otts::core::log_info("webrtc_native", context + " HEVC-to-AVC fallback ready key=" + stream_key);
+            }
+            const auto frames = hevc_to_avc->transcode(sample.data(), sample.size(), message.timestamp);
+            for (const auto& frame : frames) {
+                rtc::FrameInfo info(std::chrono::duration<double, std::milli>(frame.timestamp_ms));
+                info.isKeyFrame = frame.keyframe;
+                video_track->sendFrame(rtc_binary_from_bytes(frame.annexb), info);
+                video_frames.fetch_add(1);
+                video_bytes.fetch_add(frame.annexb.size());
+            }
             return;
         }
         if (!is_video_keyframe && !video_keyframe_seen.load()) {
@@ -686,18 +545,17 @@ struct WebRtcService::NativeSession {
                 std::lock_guard<std::mutex> lock(media_mutex);
                 with_config = video_config_sample;
             }
-            if (!with_config.empty() && message.payload[1] == 1) {
+            if (!with_config.empty()) {
                 with_config.insert(with_config.end(), sample.begin(), sample.end());
                 sample = std::move(with_config);
             }
             video_keyframe_seen.store(true);
         }
-        sample = avcc_to_annexb(sample);
         if (sample.empty()) {
             return;
         }
         rtc::FrameInfo info(std::chrono::duration<double, std::milli>(
-            avc_presentation_timestamp(message)));
+            static_cast<std::int64_t>(message.timestamp) + packet->composition_time_ms));
         info.isKeyFrame = is_video_keyframe;
         try {
             video_track->sendFrame(rtc_binary_from_bytes(sample), info);
@@ -797,13 +655,9 @@ struct WebRtcService::NativeSession {
         }
 
         if (outbound_waiting_for_keyframe && message.type_id == 9) {
-            const bool sequence_header = message.payload.size() > 1 && message.payload[1] == 0;
-            bool keyframe = message.payload.size() > 5 && message.payload[1] == 1 &&
-                ((message.payload[0] >> 4) & 0x0f) == 1;
-            if (!keyframe && message.payload.size() > 5 && message.payload[1] == 1) {
-                const std::vector<std::uint8_t> sample(message.payload.begin() + 5, message.payload.end());
-                keyframe = annexb_has_idr(avcc_to_annexb(sample));
-            }
+            const auto packet = otts::codec::parse_flv_video_packet(message.payload);
+            const bool sequence_header = packet && packet->sequence_header && packet->codec == video_codec;
+            const bool keyframe = packet && packet->coded_frames && packet->keyframe && packet->codec == video_codec;
             if (!sequence_header && !keyframe) {
                 return;
             }
@@ -872,7 +726,7 @@ WebRtcService::WebRtcService(NativeStatus native_status)
     native_status_.peer_factory_ready = true;
     native_status_.media_engine_ready = true;
     if (native_status_.detail.empty()) {
-        native_status_.detail = "native WHIP/WHEP ready: H.264 + Opus wire, AAC core audio";
+        native_status_.detail = "native WHIP/WHEP ready: H.264/H.265 + Opus wire, AAC core audio, HEVC-to-AVC fallback";
     }
 #elif OTTS_WEBRTC_NATIVE_DEPENDENCY
     native_status_.peer_factory_ready = false;
@@ -890,7 +744,7 @@ WebRtcService::WebRtcService(NativeStatus native_status)
     }
     if (native_status_.detail.empty()) {
         native_status_.detail = native_status_.media_engine_ready
-            ? "native WebRTC ready: H.264 + Opus wire, AAC core audio"
+            ? "native WebRTC ready: H.264/H.265 + Opus wire, AAC core audio, HEVC-to-AVC fallback"
             : "native dependency hook is present; PeerConnection media engine is not wired yet";
     }
 }
@@ -1083,7 +937,7 @@ void WebRtcService::update_session_state(
             native_session->direction,
             state_to_string(state),
             "native-cxx-libdatachannel:" + transport_state,
-            "h264+aac(core)/opus(webrtc)",
+            "h264/h265+aac(core)/opus(webrtc)",
             native_session->started_at_epoch_ms,
             error);
     }
@@ -1280,7 +1134,7 @@ NativeOfferResult WebRtcService::create_native_play_offer(const std::string& str
         SessionDirection::Play,
         "offering",
         "native-cxx-libdatachannel-offer",
-        "h264+aac(core)/opus(webrtc)",
+        "h264/h265+aac(core)/opus(webrtc)",
         session->started_at_epoch_ms);
 
     SessionStateData state;
@@ -1429,16 +1283,36 @@ NativeOfferResult WebRtcService::handle_native_offer_locked(
 
     try {
         bool remote_description_set = false;
+        const auto negotiated_payload_types = parse_offer_payload_types(offer_sdp);
         if (direction == SessionDirection::Play) {
-            const auto negotiated_payload_types = parse_offer_payload_types(offer_sdp);
-            const auto video_payload_type = negotiated_payload_types.h264;
+            auto source_codec = otts::media::CodecId::Avc;
+            for (const auto& stream : registry->snapshots()) {
+                if (stream.stream_key == stream_key && stream.video_codec == "h265") {
+                    source_codec = otts::media::CodecId::Hevc;
+                    break;
+                }
+            }
+            auto wire_codec = otts::media::CodecId::Avc;
+            if (source_codec == otts::media::CodecId::Hevc) {
+                if (negotiated_payload_types.preferred_video_codec == otts::media::CodecId::Hevc &&
+                    negotiated_payload_types.has_h265) {
+                    wire_codec = otts::media::CodecId::Hevc;
+                } else if (!negotiated_payload_types.has_h264 && negotiated_payload_types.has_h265) {
+                    wire_codec = otts::media::CodecId::Hevc;
+                }
+            }
+            session->source_video_codec = source_codec;
+            session->video_codec = wire_codec;
+            const auto video_payload_type = wire_codec == otts::media::CodecId::Hevc
+                ? negotiated_payload_types.h265 : negotiated_payload_types.h264;
             const auto audio_payload_type = negotiated_payload_types.opus;
             constexpr rtc::SSRC video_ssrc = 0x51545331;
             constexpr rtc::SSRC audio_ssrc = 0x51545332;
             otts::core::log_info(
                 "webrtc_native",
                 "WHEP negotiated payload types key=" + stream_key +
-                    " h264=" + std::to_string(video_payload_type) +
+                    " source=" + otts::media::to_string(source_codec) +
+                    " wire=" + otts::media::to_string(wire_codec) + ":" + std::to_string(video_payload_type) +
                     " opus=" + std::to_string(audio_payload_type) +
                     " video_mid=" + negotiated_payload_types.video_mid +
                     " audio_mid=" + negotiated_payload_types.audio_mid);
@@ -1482,19 +1356,27 @@ NativeOfferResult WebRtcService::handle_native_offer_locked(
                 }
             });
             rtc::Description::Video video(negotiated_payload_types.video_mid, rtc::Description::Direction::SendOnly);
-            video.addH264Codec(video_payload_type);
+            if (wire_codec == otts::media::CodecId::Hevc) video.addH265Codec(video_payload_type);
+            else video.addH264Codec(video_payload_type);
             video.addSSRC(video_ssrc, "otts-video", "otts-stream", "otts-video");
             auto video_track = pc->addTrack(video);
             auto video_rtp_config = std::make_shared<rtc::RtpPacketizationConfig>(
                 video_ssrc,
                 "otts-video",
                 video_payload_type,
-                rtc::H264RtpPacketizer::ClockRate);
-            auto video_packetizer = std::make_shared<rtc::H264RtpPacketizer>(rtc::NalUnit::Separator::StartSequence, video_rtp_config);
+                90000);
             auto video_sr_reporter = std::make_shared<rtc::RtcpSrReporter>(video_rtp_config);
-            video_packetizer->addToChain(video_sr_reporter);
-            video_packetizer->addToChain(std::make_shared<rtc::RtcpNackResponder>());
-            video_track->setMediaHandler(video_packetizer);
+            if (wire_codec == otts::media::CodecId::Hevc) {
+                auto packetizer = std::make_shared<rtc::H265RtpPacketizer>(rtc::NalUnit::Separator::StartSequence, video_rtp_config);
+                packetizer->addToChain(video_sr_reporter);
+                packetizer->addToChain(std::make_shared<rtc::RtcpNackResponder>());
+                video_track->setMediaHandler(packetizer);
+            } else {
+                auto packetizer = std::make_shared<rtc::H264RtpPacketizer>(rtc::NalUnit::Separator::StartSequence, video_rtp_config);
+                packetizer->addToChain(video_sr_reporter);
+                packetizer->addToChain(std::make_shared<rtc::RtcpNackResponder>());
+                video_track->setMediaHandler(packetizer);
+            }
             session->video_track = video_track;
             session->video_sr_reporter = video_sr_reporter;
             video_track->onOpen([weak = std::weak_ptr<NativeSession>(session), attach_play_callback]() {
@@ -1536,7 +1418,14 @@ NativeOfferResult WebRtcService::handle_native_offer_locked(
                 }
             });
         } else {
-            registry->upsert_external_stream(stream_key, otts::media::StreamSource::Whip, "aac", "h264", "cpp-webrtc-native", true);
+            session->video_codec = negotiated_payload_types.preferred_video_codec == otts::media::CodecId::Hevc
+                ? otts::media::CodecId::Hevc : otts::media::CodecId::Avc;
+            session->source_video_codec = session->video_codec;
+            registry->begin_external_publish(
+                stream_key, otts::media::StreamSource::Whip, "cpp-webrtc-native");
+            registry->upsert_external_stream(
+                stream_key, otts::media::StreamSource::Whip, "aac", otts::media::to_string(session->video_codec),
+                "cpp-webrtc-native", true);
             pc->onTrack([session, registry](std::shared_ptr<rtc::Track> track) {
                 const auto media_type = track->description().type();
                 if (media_type == "audio") {
@@ -1561,16 +1450,23 @@ NativeOfferResult WebRtcService::handle_native_offer_locked(
                 }
 
                 session->video_track = track;
-                track->setMediaHandler(std::make_shared<rtc::H264RtpDepacketizer>(rtc::NalUnit::Separator::StartSequence));
+                if (session->video_codec == otts::media::CodecId::Hevc) {
+                    track->setMediaHandler(std::make_shared<rtc::H265RtpDepacketizer>(rtc::NalUnit::Separator::StartSequence));
+                } else {
+                    track->setMediaHandler(std::make_shared<rtc::H264RtpDepacketizer>(rtc::NalUnit::Separator::StartSequence));
+                }
                 track->chainMediaHandler(std::make_shared<rtc::RtcpReceivingSession>());
-                auto known_sets = std::make_shared<NalSets>();
+                auto known_sets = std::make_shared<otts::codec::ParameterSets>();
                 auto base_ts = std::make_shared<std::optional<std::uint32_t>>();
                 track->onFrame([session, registry, known_sets, base_ts](rtc::binary frame, rtc::FrameInfo info) {
                     auto annexb = bytes_from_rtc_binary(frame);
                     if (annexb.empty()) {
                         return;
                     }
-                    const auto sets = extract_parameter_sets_from_annexb(annexb);
+                    const auto sets = otts::codec::extract_parameter_sets(annexb, session->video_codec);
+                    if (!sets.vps.empty()) {
+                        known_sets->vps = sets.vps;
+                    }
                     if (!sets.sps.empty()) {
                         known_sets->sps = sets.sps;
                     }
@@ -1580,15 +1476,23 @@ NativeOfferResult WebRtcService::handle_native_offer_locked(
                     const auto timestamp = media_timestamp_ms_from_rtp(
                         info,
                         base_ts,
-                        rtc::H264RtpPacketizer::ClockRate);
-                    if (!known_sets->sps.empty() && !known_sets->pps.empty()) {
+                        90000);
+                    if (known_sets->complete(session->video_codec)) {
+                        otts::rtmp::MediaMessage config;
+                        config.timestamp = timestamp;
+                        config.type_id = 9;
+                        config.payload = otts::codec::make_flv_video_config(session->video_codec, *known_sets);
                         registry->publish_external_media(
                             session->stream_key,
                             otts::media::StreamSource::Whip,
                             "cpp-webrtc-native",
-                            make_avc_sequence_header(timestamp, *known_sets));
+                            config);
                     }
-                    auto media = make_avc_nalu_message(timestamp, annexb);
+                    otts::rtmp::MediaMessage media;
+                    media.timestamp = timestamp;
+                    media.type_id = 9;
+                    media.payload = otts::codec::make_flv_video_sample(
+                        session->video_codec, annexb, otts::codec::is_keyframe(annexb, session->video_codec));
                     if (media.payload.size() > 5) {
                         session->video_frames.fetch_add(1);
                         session->video_bytes.fetch_add(annexb.size());
@@ -1609,7 +1513,7 @@ NativeOfferResult WebRtcService::handle_native_offer_locked(
             direction,
             "answering",
             "native-cxx-libdatachannel",
-            "h264+aac(core)/opus(webrtc)",
+            "h264/h265+aac(core)/opus(webrtc)",
             session->started_at_epoch_ms);
 
         SessionStateData state;
@@ -1653,7 +1557,7 @@ NativeOfferResult WebRtcService::handle_native_offer_locked(
             direction,
             "running",
             "native-cxx-libdatachannel",
-            "h264+aac(core)/opus(webrtc)",
+            "h264/h265+aac(core)/opus(webrtc)",
             session->started_at_epoch_ms);
 
         {

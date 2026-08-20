@@ -13,6 +13,7 @@ set(OTTS_LIBDATACHANNEL_ROOT "" CACHE PATH "Path to libdatachannel install prefi
 add_executable(otts_rtmp
     cpp/src/main.cpp
     cpp/src/auth/stream_auth.cpp
+    cpp/src/codec/video_codec.cpp
     cpp/src/core/logger.cpp
     cpp/src/core/process_supervisor.cpp
     cpp/src/http/flv_mux.cpp
@@ -96,7 +97,9 @@ if (OTTS_ENABLE_WEBRTC_DATACHANNEL)
     pkg_check_modules(AVUTIL REQUIRED libavutil)
     pkg_check_modules(SWRESAMPLE REQUIRED libswresample)
     find_library(USRSCTP_LIBRARY NAMES usrsctp REQUIRED)
-    target_sources(otts_rtmp PRIVATE cpp/src/webrtc/audio_transcoder.cpp)
+    target_sources(otts_rtmp PRIVATE
+        cpp/src/webrtc/audio_transcoder.cpp
+        cpp/src/webrtc/video_transcoder.cpp)
     target_compile_definitions(otts_rtmp PRIVATE OTTS_WEBRTC_DATACHANNEL=1)
     target_include_directories(otts_rtmp SYSTEM PRIVATE
         "${OTTS_LIBDATACHANNEL_INCLUDE_DIR}"

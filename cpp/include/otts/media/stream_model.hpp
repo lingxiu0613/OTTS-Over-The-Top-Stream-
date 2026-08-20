@@ -34,6 +34,8 @@ struct MediaPacket {
     MediaKind kind{MediaKind::Data};
     CodecId codec{CodecId::Unknown};
     std::uint32_t timestamp_ms{0};
+    std::uint32_t dts_ms{0};
+    std::int64_t pts_ms{0};
     std::uint32_t message_stream_id{1};
     bool is_sequence_header{false};
     bool is_keyframe{false};
@@ -45,6 +47,9 @@ struct TrackState {
     CodecId codec{CodecId::Unknown};
     bool present{false};
     bool has_sequence_header{false};
+    bool has_vps{false};
+    bool has_sps{false};
+    bool has_pps{false};
     std::uint32_t last_timestamp_ms{0};
     std::uint64_t packets{0};
     std::uint64_t bytes{0};

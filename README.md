@@ -4,39 +4,38 @@ OTTS is an open-source streaming server for Ubuntu. It uses a C++20 media core,
 a Node.js control plane and web console, and Python for smoke tests and optional
 compatibility tooling.
 
-The current development snapshot has been validated with H.264 video and AAC
-audio across the shared media core, RTMP, HTTP-FLV, HLS, RTSP, and SRT. Native
-WHIP/WHEP uses H.264 video and standards-compatible Opus on the WebRTC wire;
-the C++ media core transcodes WHIP Opus to AAC and WHEP AAC back to Opus.
-
-This README describes the development snapshot after `v0.3.0`. The working
-tree adds native WebRTC audio bridging, paced WHEP playback, dynamic SRT stream
-routing, and multi-session SRT egress. H.265 is a planned next-stage feature
-and is not part of this snapshot.
+The current development snapshot supports H.264 and H.265/HEVC in one shared
+media model. HEVC has been validated through SRT MPEG-TS, native RTSP, Enhanced
+RTMP, HTTP-FLV, HLS fMP4, and native WHIP/WHEP. Native WebRTC uses Opus on the
+wire and AAC in the shared core. For reliable browser playback, OTTS can
+transcode HEVC to low-latency H.264 with FFmpeg/libx264; direct H.265 WebRTC is
+also available for compatible peers and low-delay HEVC sources.
 
 ## Current Status
 
-| Protocol | Publish | Play | Current path |
-| --- | --- | --- | --- |
-| RTMP | Yes | Yes | Native C++ |
-| HTTP-FLV | - | Yes | Native C++ remux |
-| HLS | - | Yes | Node-managed FFmpeg segmenter |
-| WHIP | Yes | - | Native C++ / libdatachannel |
-| WHEP | - | Yes | Native C++ / libdatachannel |
-| RTSP | Yes | Yes | Native C++ RTP ingest and egress |
-| SRT | Yes | Yes | Native C++ libsrt + MPEG-TS |
+| Protocol | Publish | Play | H.264 | H.265 | Current path |
+| --- | --- | --- | --- | --- | --- |
+| RTMP | Yes | Yes | Yes | Enhanced RTMP | Native C++ |
+| HTTP-FLV | - | Yes | Yes | Enhanced FLV | Native C++ remux |
+| HLS | - | Yes | MPEG-TS | fMP4 | Node-managed FFmpeg segmenter |
+| WHIP | Yes | - | Yes | Yes when peer offers H265 | Native C++ / libdatachannel |
+| WHEP | - | Yes | Yes | Direct H265 for low-delay sources or H.264 fallback | Native C++ / libdatachannel |
+| RTSP | Yes | Yes | Yes | RFC 7798 RTP | Native C++ RTP ingest and egress |
+| SRT | Yes | Yes | Yes | MPEG-TS stream type `0x24` | Native C++ libsrt + MPEG-TS |
 
 Implemented runtime features include:
 
 - unified stream registry, tracks, packet statistics, GOP cache, and fanout;
-- H.264/AAC sequence-header caching and late-subscriber startup;
+- AVC/HEVC parameter-set caching, DTS/PTS handling, GOP startup, and fanout;
+- shared Annex-B, length-prefixed, AVCDecoderConfigurationRecord, and hvcC conversion;
 - stream health, session, disconnect, and Prometheus-style metrics APIs;
 - SRS-compatible WHIP/WHEP HTTP endpoints;
 - per-session Opus/AAC audio transcoding between WebRTC and the shared core;
-- RTSP H.264/AAC RTP over UDP publish and UDP/TCP-interleaved play;
+- RTSP H.264/H.265 plus AAC RTP publish and UDP/TCP-interleaved play;
 - SRT listener-mode ingest and dynamic multi-session egress routing;
 - HTTP-FLV slow-client protection and connection statistics;
-- HLS readiness, master playlist, restart, and cleanup management;
+- HLS MPEG-TS/fMP4 selection, master playlist, restart, and cleanup management;
+- on-demand HEVC-to-H.264 WHEP fallback using libavcodec and libx264;
 - FLV/MP4 recording lifecycle;
 - token and HMAC-signed stream authorization;
 - browser dashboard and WHIP/WHEP test page.
@@ -101,7 +100,7 @@ sudo apt install -y \
   nodejs npm python3 \
   libssl-dev libsrt-openssl-dev \
   libnice-dev libsrtp2-dev libusrsctp-dev \
-  libavcodec-dev libavutil-dev libswresample-dev
+  libavcodec-extra libavcodec-dev libavutil-dev libswresample-dev
 ```
 
 Install the Node dependency:
@@ -112,12 +111,13 @@ npm ci
 cd ..
 ```
 
-Python packages such as `aiohttp`, `aiortc`, and `av` are only required by
-the optional Python WebRTC gateway and related test tools.
+Python packages `aiohttp`, `aiortc`, and `av` are only required by the optional
+Python WebRTC gateway and WebRTC smoke tools. On Ubuntu they can be installed
+from distribution packages when available, or in a virtual environment.
 
 ## Build
 
-### Native RTMP, HTTP-FLV, RTSP, and SRT
+### Native RTMP, HTTP-FLV, RTSP, SRT, and HEVC codec model
 
 ```bash
 cmake -S . -B build
@@ -155,7 +155,8 @@ cmake -S . -B build \
 cmake --build build -j"$(nproc)"
 ```
 
-The resulting executable is:
+The libdatachannel build also enables native WHIP/WHEP, Opus/AAC conversion,
+and the HEVC-to-H.264 fallback. The resulting executable is:
 
 ```text
 build/otts_rtmp
@@ -249,6 +250,39 @@ SRT:  srt://192.168.40.11:10000?mode=caller&transtype=live&streamid=live/nolo001
 
 This path performs remuxing and protocol conversion, not video transcoding.
 
+### H.265 / HEVC Cross-Protocol Fanout
+
+Use SRT MPEG-TS for a portable HEVC ingest test. The Haivision-style stream ID
+routes this publisher to `live/hevc-demo` without changing server configuration:
+
+```bash
+ffmpeg -re -i news_1280x720.mp4 \
+  -c:v libx265 -preset ultrafast -pix_fmt yuv420p -g 50 -bf 0 \
+  -c:a aac -f mpegts \
+  "srt://192.168.40.11:9000?mode=caller&transtype=live&streamid=#!::r=live/hevc-demo,m=publish"
+```
+
+The same HEVC/AAC stream can be read concurrently from:
+
+```text
+SRT:       srt://192.168.40.11:10000?mode=caller&transtype=live&streamid=#!::r=live/hevc-demo,m=request
+RTMP:      rtmp://192.168.40.11:1935/live/hevc-demo
+HTTP-FLV:  http://192.168.40.11:8080/live/hevc-demo.flv
+RTSP:      rtsp://192.168.40.11:8556/live__hevc-demo.sdp
+HLS:       http://192.168.40.11:3000/hls/live/hevc-demo/master.m3u8
+WHEP:      http://192.168.40.11:1985/rtc/v1/whep/?app=live&stream=hevc-demo
+```
+
+Enhanced RTMP and HTTP-FLV carry an `hvc1` FourCC and hvcC configuration with
+length-prefixed coded NAL units. Client support varies; current FFmpeg builds
+can be used for protocol verification. HEVC HLS uses `init.mp4` and `.m4s`
+segments with `EXT-X-MAP` instead of MPEG-TS segments.
+
+`-bf 0` produces a low-delay HEVC stream suitable for direct browser WHEP.
+File-oriented HEVC commonly contains B-frames and remains valid for RTMP, SRT,
+RTSP, HTTP-FLV, and HLS, but some browser WebRTC H.265 decoders discard those
+B-frames. In that case, use the default H.264 WHEP preference on the test page.
+
 ### RTMP
 
 Publish:
@@ -276,8 +310,8 @@ Browser playback is provided by the dashboard using flv.js.
 ### HLS
 
 ```text
-http://192.168.40.11:3000/hls/live__nolo001/index.m3u8
-http://192.168.40.11:3000/hls/live__nolo001/master.m3u8
+http://192.168.40.11:3000/hls/live/nolo001/index.m3u8
+http://192.168.40.11:3000/hls/live/nolo001/master.m3u8
 ```
 
 ### WHIP / WHEP
@@ -300,17 +334,27 @@ The first URL can be used by OBS WHIP output. The browser test page is:
 https://192.168.40.11:3443/webrtc.html
 ```
 
-WebRTC negotiates Opus audio with OBS and browsers. OTTS stores WHIP audio as
-AAC in the shared stream registry, allowing the same stream to be consumed by
+WebRTC negotiates Opus audio with OBS and browsers. OTTS respects the video
+codec order in the peer SDP: H.265 is selected when it is the peer's preferred
+offered codec, otherwise H.264 is selected. OTTS stores WHIP audio as AAC in
+the shared stream registry, allowing the same stream to be consumed by
 AAC-based outputs. WHEP accepts AAC from RTMP, RTSP, SRT, or WHIP sources and
 transcodes it to Opus for the WebRTC receiver.
+
+The browser test page defaults to `H.264 (stable)` playback. When the source is
+HEVC, OTTS lazily starts an HEVC-to-H.264 transcoder and begins decoding from a
+cached parameter-set keyframe. The page also exposes an explicit H.265 direct
+option for compatible browsers, GPUs, and low-delay HEVC streams without
+B-frames. This choice changes only the WebRTC output and keeps the same WHEP
+URL and shared source stream.
 
 The WHEP sender preserves the complete cached GOP and AVC sequence headers,
 paces output by media timestamps, and waits for the next keyframe after a slow
 client queue overflow. The browser test page reports decoded FPS, receive
 bitrate, packet loss, dropped frames, jitter, and jitter-buffer delay. For a
-1280x720 30 fps input, the page should normally report approximately 30 decoded
-fps with zero packet loss and zero dropped frames.
+1280x720 30 fps input, H.264-compatible playback should normally report
+approximately 30 decoded fps with zero packet loss. Direct H.265 results depend
+on browser, GPU, HEVC profile, and whether the source contains B-frames.
 
 When the configured certificate files do not exist, the Node control plane
 uses OpenSSL to generate a local self-signed development certificate. The key
@@ -319,9 +363,10 @@ configured.
 
 ### RTSP
 
-The native RTSP path currently supports H.264 video and AAC audio. Publish to
-port 8554 and play from port 8556. A stream key containing `/` is represented
-as `__` in the RTSP path.
+The native RTSP path supports H.264 or H.265 video with AAC audio. H.265 uses
+RFC 7798 single-NAL, aggregation-packet, and fragmentation-unit RTP handling.
+Publish to port 8554 and play from port 8556. A stream key containing `/` is
+represented as `__` in the RTSP path.
 
 Publish:
 
@@ -338,9 +383,9 @@ Play:
 ffplay rtsp://192.168.40.11:8556/live__rtsp-compat.sdp
 ```
 
-The RTSP implementation parses AAC SDP and RFC 3640 AU headers, publishes audio
-and video into the shared registry, reorders both tracks on one media clock,
-and paces cached/live RTP output to avoid burst loss and slow-motion playback.
+The RTSP implementation parses H.264/H.265 parameter sets, AAC SDP and RFC 3640
+AU headers, publishes both tracks into the shared registry, and preserves DTS,
+PTS, and RTP presentation timestamps for B-frame playback.
 
 ### SRT
 
@@ -364,6 +409,8 @@ server configuration. The play listener supports concurrent clients and differen
 stream IDs on the same UDP port. OTTS also accepts Haivision-style stream IDs such
 as `#!::r=live/nolo001,m=request`; when `streamid` is omitted, the configured
 `OTTS_CPP_SRT_STREAM_KEY` remains the compatibility fallback.
+MPEG-TS PMT stream types `0x1b` (AVC) and `0x24` (HEVC) are discovered
+dynamically; OTTS does not assume fixed elementary PIDs.
 
 ## Web Console And APIs
 
@@ -444,6 +491,16 @@ python3 python/smoke_webrtc_native.py \
   --stream-key live/webrtc-smoke --duration 8
 ```
 
+Run the complete H.265 cross-protocol regression using a generated test source:
+
+```bash
+bash scripts/smoke_hevc.sh
+```
+
+This verifies HEVC+AAC over SRT, Enhanced RTMP, HTTP-FLV, RTSP, and HLS fMP4,
+checks H.265 WHIP/WHEP SDP negotiation, and exercises WHEP HEVC-to-H.264
+fallback with decoded video and audio frames.
+
 Test WHEP playback against an already-published stream:
 
 ```bash
@@ -482,13 +539,16 @@ Build directories, local configuration, test media, archives, logs,
 
 ## Current Limits
 
-- Video processing is remux/passthrough. The native WebRTC adapter transcodes
-  audio between Opus on the wire and AAC in the shared core.
-- The primary tested video/audio combination is H.264 + AAC.
-- Native WHIP/WHEP uses browser/OBS-compatible H.264 + Opus on the wire and
-  exposes AAC audio to the rest of OTTS.
-- H.265, cluster forwarding, replay, and production certificate automation are
-  planned rather than complete.
+- Video processing is remux/passthrough except for the on-demand WHEP
+  HEVC-to-H.264 fallback. Audio is converted between WebRTC Opus and core AAC.
+- The tested HEVC profile is 8-bit 4:2:0. Client support for Enhanced RTMP,
+  HTTP-FLV HEVC, and WebRTC HEVC varies by player, browser, OS, and GPU.
+- The native HEVC-to-H.264 fallback is per WHEP session and prioritizes low
+  latency over encoding efficiency; shared transcoder pooling is future work.
+- Direct H.265 WHEP is intended for low-delay HEVC without B-frames. Use the
+  default H.264 WHEP preference for file-oriented HEVC containing B-frames.
+- Cluster forwarding, replay, and production certificate automation remain
+  future work.
 - HLS and recording still use managed FFmpeg workers.
 - SRT callers that omit `streamid` use the configured compatibility fallback
   stream.

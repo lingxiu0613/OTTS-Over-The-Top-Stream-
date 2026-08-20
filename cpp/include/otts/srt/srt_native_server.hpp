@@ -4,8 +4,10 @@
 
 #include <atomic>
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 
 namespace otts::srt {
 
@@ -36,6 +38,8 @@ private:
     std::thread play_thread_;
     int publish_socket_{-1};
     int play_socket_{-1};
+    std::mutex publishers_mutex_;
+    std::unordered_map<std::string, int> active_publishers_;
 };
 
 }  // namespace otts::srt
