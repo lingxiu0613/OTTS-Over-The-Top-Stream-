@@ -208,6 +208,23 @@
         color: #991b1b;
       }
 
+      .section-tabs {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+        margin: 0 0 16px;
+        position: sticky;
+        top: 0;
+        z-index: 5;
+        padding: 10px 0;
+        background: var(--bg);
+      }
+
+      .section-tab.active { background: #0f172a; color: #fff; }
+      .page-section { display: none; }
+      .page-section.active { display: block; }
+      .url-list code { display: block; margin: 3px 0; }
+
       code {
         color: #1d4ed8;
         overflow-wrap: anywhere;
@@ -238,6 +255,13 @@
         </div>
         <p><a href="/webrtc.html">WHIP/WHEP 测试台</a></p>
       </div>
+
+      <nav class="section-tabs" aria-label="管理页面分区">
+        <button class="section-tab active" data-section="overview">概览</button>
+        <button class="section-tab secondary" data-section="playback">流与播放</button>
+        <button class="section-tab secondary" data-section="protocols">协议会话</button>
+        <button class="section-tab secondary" data-section="diagnostics">诊断与日志</button>
+      </nav>
 
       <div class="card">
         <h2>运行概览</h2>
@@ -429,7 +453,7 @@
       <div class="two-col">
         <div class="card">
           <h2>Browser Player</h2>
-          <p class="muted">Browser playback currently uses HTTP-FLV. RTMP is for ffplay/PotPlayer. HLS URLs are generated for external HLS-capable players.</p>
+          <p class="muted">支持浏览器 HTTP-FLV 与 HLS。RTMP/RTSP/SRT 请使用对应专业播放器。</p>
           <p><input id="playUrl" value="http://127.0.0.1:8080/live/demo.flv" /></p>
           <p>
             <button id="playBtn">Play</button>
@@ -460,8 +484,10 @@
     </main>
 
     <script src="https://cdn.jsdelivr.net/npm/flv.js@1.6.2/dist/flv.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js"></script>
     <script>
       let currentPlayer = null;
+      let currentHls = null;
       let currentState = { streams: [] };
       let currentWebrtc = { sessions: [], published_streams: [] };
       let currentRuntime = { managed_processes: [] };
@@ -480,8 +506,8 @@
         return {
           rtmp: `rtmp://${host}:1935/${streamKey}`,
           flv: `http://${host}:8080/${streamKey}.flv`,
-          hls: `http://${host}:3000/hls/${streamKey.split("/").map(encodeURIComponent).join("/")}/index.m3u8`,
-          hlsMaster: `http://${host}:3000/hls/${streamKey.split("/").map(encodeURIComponent).join("/")}/master.m3u8`
+          hls: `${window.location.origin}/hls/${streamKey.split("/").map(encodeURIComponent).join("/")}/index.m3u8`,
+          hlsMaster: `${window.location.origin}/hls/${streamKey.split("/").map(encodeURIComponent).join("/")}/master.m3u8`
         };
       }
 
@@ -541,14 +567,18 @@
       }
 
       function stopPlayer() {
-        if (!currentPlayer) {
-          return;
+        if (currentPlayer) {
+          currentPlayer.pause();
+          currentPlayer.unload();
+          currentPlayer.detachMediaElement();
+          currentPlayer.destroy();
+          currentPlayer = null;
         }
-        currentPlayer.pause();
-        currentPlayer.unload();
-        currentPlayer.detachMediaElement();
-        currentPlayer.destroy();
-        currentPlayer = null;
+        if (currentHls) {
+          currentHls.destroy();
+          currentHls = null;
+        }
+        document.getElementById("video").removeAttribute("src");
         document.getElementById("playerStatus").textContent = "Stopped";
       }
 
@@ -563,9 +593,25 @@
           return;
         }
 
-        if (url.endsWith(".m3u8")) {
-          document.getElementById("playerStatus").textContent =
-            "HLS URL prepared. Open it in an HLS-capable player, or add hls.js later.";
+        if (url.includes(".m3u8")) {
+          if (video.canPlayType("application/vnd.apple.mpegurl")) {
+            video.src = url;
+            video.play().catch(() => {});
+            document.getElementById("playerStatus").textContent = `HLS 播放中：${url}`;
+            return;
+          }
+          if (!window.Hls || !Hls.isSupported()) {
+            document.getElementById("playerStatus").textContent = "当前浏览器不支持 HLS，请升级浏览器或使用 FLV。";
+            return;
+          }
+          currentHls = new Hls({ liveSyncDurationCount: 3, enableWorker: true });
+          currentHls.on(Hls.Events.ERROR, (_event, data) => {
+            if (data.fatal) document.getElementById("playerStatus").textContent = `HLS 错误：${data.details || "播放失败"}`;
+          });
+          currentHls.loadSource(url);
+          currentHls.attachMedia(video);
+          currentHls.on(Hls.Events.MANIFEST_PARSED, () => video.play().catch(() => {}));
+          document.getElementById("playerStatus").textContent = `HLS 连接中：${url}`;
           return;
         }
 
@@ -574,8 +620,11 @@
           return;
         }
 
-        currentPlayer = flvjs.createPlayer({ type: "flv", isLive: true, url });
+        currentPlayer = flvjs.createPlayer({ type: "flv", isLive: true, hasAudio: true, hasVideo: true, url });
         currentPlayer.attachMediaElement(video);
+        currentPlayer.on(flvjs.Events.ERROR, (type, detail) => {
+          document.getElementById("playerStatus").textContent = `FLV 错误：${type} ${detail || ""}`;
+        });
         currentPlayer.load();
         currentPlayer.play();
         document.getElementById("playerStatus").textContent = `Playing ${url}`;
@@ -917,8 +966,8 @@
               <td><code>${urls.rtmp}</code><br/><code>${urls.flv}</code><br/><code>${urls.hls}</code><br/><code>${urls.hlsMaster}</code></td>
               <td>${hlsBadge}<br/>pid:${hls.pid ?? "-"}<br/>exit:${hls.last_exit_code ?? "-"}<br/>restart:${hls.restart_count ?? 0}<br/>bridge:${webrtc ? (webrtc.recorder_started ? "active" : (webrtc.bridge_active ? "ready" : "off")) : "-"}</td>
               <td>
-                <button class="good" data-action="play-flv" data-url="${urls.flv}">Play FLV</button>
-                <button class="secondary" data-action="copy-hls" data-url="${urls.hls}">Use HLS</button>
+                <button class="good" data-action="play-flv" data-url="${urls.flv}" data-hls-url="${urls.hls}" data-video-codec="${stream.video_codec || ""}">Play FLV</button>
+                <button class="secondary" data-action="play-hls" data-url="${urls.hls}" data-stream="${stream.stream_key}">Play HLS</button>
                 <button data-action="start-hls" data-stream="${stream.stream_key}">Start HLS</button>
                 <button class="secondary" data-action="stop-hls" data-stream="${stream.stream_key}">Stop HLS</button>
                 <button data-action="disconnect" data-stream="${stream.stream_key}">Disconnect</button>
@@ -944,11 +993,23 @@
             button.disabled = true;
             try {
               if (action === "play-flv") {
-                document.getElementById("playUrl").value = url;
+                const hlsUrl = button.getAttribute("data-hls-url");
+                const codec = (button.getAttribute("data-video-codec") || "").toLowerCase();
+                // Browsers cannot decode HEVC in FLV/MSE. Route this button
+                // through the HLS transcode pipeline while retaining direct
+                // FLV for AVC streams.
+                const playbackUrl = (codec === "h265" || codec === "hevc") ? hlsUrl : url;
+                document.getElementById("playUrl").value = playbackUrl;
+                if (playbackUrl === hlsUrl) {
+                  const hlsStatus = currentState.streams.find((item) => item.stream_key === streamKey)?.hls;
+                  if (!hlsStatus?.playlist_ready) await startHls(streamKey);
+                }
                 playCurrentUrl();
-              } else if (action === "copy-hls") {
+              } else if (action === "play-hls") {
                 document.getElementById("playUrl").value = url;
-                document.getElementById("playerStatus").textContent = "HLS URL filled into the player box.";
+                const hlsStatus = currentState.streams.find((item) => item.stream_key === streamKey)?.hls;
+                if (!hlsStatus?.playlist_ready) await startHls(streamKey);
+                playCurrentUrl();
               } else if (action === "start-hls") {
                 await startHls(streamKey);
               } else if (action === "stop-hls") {
@@ -1078,6 +1139,21 @@
       document.getElementById("srtStartPublishBtn").addEventListener("click", () => startSrt("publish"));
       document.getElementById("srtStartPlayBtn").addEventListener("click", () => startSrt("play"));
       document.getElementById("srtStopBtn").addEventListener("click", stopSrt);
+
+      // Keep the console compact: protocol-heavy details stay behind short, stable sections.
+      const sectionOrder = ["overview", "overview", "protocols", "playback", "protocols", "protocols", "protocols", "protocols", "playback", "diagnostics"];
+      const pagePanels = [...document.querySelectorAll("main > .card, main > .two-col")];
+      pagePanels.forEach((panel, index) => {
+        panel.dataset.sectionPanel = sectionOrder[index] || "diagnostics";
+        panel.classList.add("page-section");
+        panel.classList.toggle("active", index < 2);
+      });
+      document.querySelectorAll(".section-tab").forEach((tab) => tab.addEventListener("click", () => {
+        const section = tab.dataset.section;
+        document.querySelectorAll(".section-tab").forEach((item) => item.classList.toggle("active", item === tab));
+        document.querySelectorAll("[data-section-panel]").forEach((panel) => panel.classList.toggle("active", panel.dataset.sectionPanel === section));
+        window.scrollTo({ top: 0, behavior: "smooth" });
+      }));
 
       load();
       refreshRuntimeLog();

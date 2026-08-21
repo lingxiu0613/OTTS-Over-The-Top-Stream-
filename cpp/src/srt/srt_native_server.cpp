@@ -1,6 +1,6 @@
 #include "otts/srt/srt_native_server.hpp"
-
 #include "otts/codec/video_codec.hpp"
+
 #include "otts/core/logger.hpp"
 
 #include <srt/srt.h>
@@ -37,9 +37,11 @@ std::uint64_t now_epoch_ms() {
             .count());
 }
 
-otts::rtmp::StreamRegistry::CallbackId next_callback_id() {
-    static std::atomic<otts::rtmp::StreamRegistry::CallbackId> next{1};
-    return next.fetch_add(1, std::memory_order_relaxed);
+std::uint32_t read_be32(const std::uint8_t* data) {
+    return (static_cast<std::uint32_t>(data[0]) << 24) |
+           (static_cast<std::uint32_t>(data[1]) << 16) |
+           (static_cast<std::uint32_t>(data[2]) << 8) |
+           static_cast<std::uint32_t>(data[3]);
 }
 
 void write_be16(std::vector<std::uint8_t>& out, std::uint16_t value) {
@@ -63,6 +65,207 @@ std::uint32_t crc32_mpeg(const std::uint8_t* data, std::size_t size) {
         }
     }
     return crc;
+}
+
+std::vector<std::uint8_t> annexb_to_avcc(const std::vector<std::uint8_t>& annexb) {
+    std::vector<std::uint8_t> out;
+    std::size_t i = 0;
+    auto start_code = [&](std::size_t pos, std::size_t& len) {
+        if (pos + 3 <= annexb.size() && annexb[pos] == 0 && annexb[pos + 1] == 0 && annexb[pos + 2] == 1) {
+            len = 3;
+            return true;
+        }
+        if (pos + 4 <= annexb.size() && annexb[pos] == 0 && annexb[pos + 1] == 0 && annexb[pos + 2] == 0 && annexb[pos + 3] == 1) {
+            len = 4;
+            return true;
+        }
+        return false;
+    };
+    while (i < annexb.size()) {
+        std::size_t sc_len = 0;
+        if (!start_code(i, sc_len)) {
+            ++i;
+            continue;
+        }
+        const auto nal_start = i + sc_len;
+        auto nal_end = nal_start;
+        while (nal_end < annexb.size()) {
+            std::size_t next_len = 0;
+            if (start_code(nal_end, next_len)) {
+                break;
+            }
+            ++nal_end;
+        }
+        const auto nal_size = nal_end - nal_start;
+        if (nal_size > 0) {
+            write_be32(out, static_cast<std::uint32_t>(nal_size));
+            out.insert(out.end(), annexb.begin() + static_cast<std::ptrdiff_t>(nal_start), annexb.begin() + static_cast<std::ptrdiff_t>(nal_end));
+        }
+        i = nal_end;
+    }
+    return out;
+}
+
+struct NalSets {
+    std::vector<std::uint8_t> sps;
+    std::vector<std::uint8_t> pps;
+};
+
+NalSets extract_parameter_sets(const std::vector<std::uint8_t>& annexb) {
+    NalSets sets;
+    std::size_t i = 0;
+    auto start_code = [&](std::size_t pos, std::size_t& len) {
+        if (pos + 3 <= annexb.size() && annexb[pos] == 0 && annexb[pos + 1] == 0 && annexb[pos + 2] == 1) {
+            len = 3;
+            return true;
+        }
+        if (pos + 4 <= annexb.size() && annexb[pos] == 0 && annexb[pos + 1] == 0 && annexb[pos + 2] == 0 && annexb[pos + 3] == 1) {
+            len = 4;
+            return true;
+        }
+        return false;
+    };
+    while (i < annexb.size()) {
+        std::size_t sc_len = 0;
+        if (!start_code(i, sc_len)) {
+            ++i;
+            continue;
+        }
+        const auto nal_start = i + sc_len;
+        auto nal_end = nal_start;
+        while (nal_end < annexb.size()) {
+            std::size_t next_len = 0;
+            if (start_code(nal_end, next_len)) {
+                break;
+            }
+            ++nal_end;
+        }
+        if (nal_end > nal_start) {
+            const auto nal_type = annexb[nal_start] & 0x1f;
+            if (nal_type == 7 && sets.sps.empty()) {
+                sets.sps.assign(annexb.begin() + static_cast<std::ptrdiff_t>(nal_start), annexb.begin() + static_cast<std::ptrdiff_t>(nal_end));
+            } else if (nal_type == 8 && sets.pps.empty()) {
+                sets.pps.assign(annexb.begin() + static_cast<std::ptrdiff_t>(nal_start), annexb.begin() + static_cast<std::ptrdiff_t>(nal_end));
+            }
+        }
+        i = nal_end;
+    }
+    return sets;
+}
+
+bool has_idr(const std::vector<std::uint8_t>& annexb) {
+    for (std::size_t i = 0; i + 4 < annexb.size(); ++i) {
+        bool code3 = annexb[i] == 0 && annexb[i + 1] == 0 && annexb[i + 2] == 1;
+        bool code4 = i + 4 < annexb.size() && annexb[i] == 0 && annexb[i + 1] == 0 && annexb[i + 2] == 0 && annexb[i + 3] == 1;
+        if (code3 || code4) {
+            const auto nal = i + (code3 ? 3 : 4);
+            if (nal < annexb.size() && (annexb[nal] & 0x1f) == 5) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+otts::rtmp::MediaMessage make_avc_sequence_header(std::uint32_t timestamp, const NalSets& sets) {
+    otts::rtmp::MediaMessage message;
+    message.timestamp = timestamp;
+    message.type_id = 9;
+    message.message_stream_id = 1;
+    message.payload = {0x17, 0x00, 0x00, 0x00, 0x00};
+    message.payload.push_back(0x01);
+    message.payload.push_back(sets.sps.size() > 1 ? sets.sps[1] : 0x64);
+    message.payload.push_back(sets.sps.size() > 2 ? sets.sps[2] : 0x00);
+    message.payload.push_back(sets.sps.size() > 3 ? sets.sps[3] : 0x1f);
+    message.payload.push_back(0xff);
+    message.payload.push_back(0xe1);
+    write_be16(message.payload, static_cast<std::uint16_t>(sets.sps.size()));
+    message.payload.insert(message.payload.end(), sets.sps.begin(), sets.sps.end());
+    message.payload.push_back(0x01);
+    write_be16(message.payload, static_cast<std::uint16_t>(sets.pps.size()));
+    message.payload.insert(message.payload.end(), sets.pps.begin(), sets.pps.end());
+    return message;
+}
+
+otts::rtmp::MediaMessage make_avc_nalu_message(std::uint32_t timestamp, const std::vector<std::uint8_t>& annexb, bool keyframe) {
+    otts::rtmp::MediaMessage message;
+    message.timestamp = timestamp;
+    message.type_id = 9;
+    message.message_stream_id = 1;
+    message.payload.push_back(static_cast<std::uint8_t>((keyframe ? 0x10 : 0x20) | 0x07));
+    message.payload.push_back(0x01);
+    message.payload.push_back(0x00);
+    message.payload.push_back(0x00);
+    message.payload.push_back(0x00);
+    auto avcc = annexb_to_avcc(annexb);
+    message.payload.insert(message.payload.end(), avcc.begin(), avcc.end());
+    return message;
+}
+
+std::vector<std::uint8_t> flv_video_to_annexb(const otts::rtmp::MediaMessage& message) {
+    std::vector<std::uint8_t> out;
+    if (message.type_id != 9 || message.payload.size() < 5) {
+        return out;
+    }
+    const auto codec_id = static_cast<std::uint8_t>(message.payload[0] & 0x0f);
+    // AVC (7) and HEVC (12) use the same length-prefixed NALU layout in the
+    // normalized FLV messages stored by the registry.
+    if ((codec_id != 7 && codec_id != 12) || message.payload[1] != 1) {
+        return out;
+    }
+    std::size_t cursor = 5;
+    while (cursor + 4 <= message.payload.size()) {
+        const auto size = read_be32(message.payload.data() + cursor);
+        cursor += 4;
+        if (size == 0 || cursor + size > message.payload.size()) {
+            break;
+        }
+        out.insert(out.end(), {0x00, 0x00, 0x00, 0x01});
+        out.insert(out.end(), message.payload.begin() + static_cast<std::ptrdiff_t>(cursor), message.payload.begin() + static_cast<std::ptrdiff_t>(cursor + size));
+        cursor += size;
+    }
+    return out;
+}
+
+std::vector<std::uint8_t> flv_video_config_to_annexb(const otts::rtmp::MediaMessage& message) {
+    std::vector<std::uint8_t> out;
+    if (message.type_id != 9 || message.payload.size() < 11 || message.payload[1] != 0) {
+        return out;
+    }
+    const auto codec_id = static_cast<std::uint8_t>(message.payload[0] & 0x0f);
+    auto append_nal = [&](std::size_t& cursor) -> bool {
+        if (cursor + 2 > message.payload.size()) return false;
+        const auto size = static_cast<std::size_t>((message.payload[cursor] << 8) | message.payload[cursor + 1]);
+        cursor += 2;
+        if (size == 0 || cursor + size > message.payload.size()) return false;
+        out.insert(out.end(), {0x00, 0x00, 0x00, 0x01});
+        out.insert(out.end(), message.payload.begin() + static_cast<std::ptrdiff_t>(cursor), message.payload.begin() + static_cast<std::ptrdiff_t>(cursor + size));
+        cursor += size;
+        return true;
+    };
+    if (codec_id == 7) {
+        std::size_t cursor = 10;
+        const auto sps_count = static_cast<unsigned>(message.payload[cursor++] & 0x1f);
+        for (unsigned i = 0; i < sps_count; ++i) if (!append_nal(cursor)) return {};
+        if (cursor >= message.payload.size()) return out;
+        const auto pps_count = static_cast<unsigned>(message.payload[cursor++]);
+        for (unsigned i = 0; i < pps_count; ++i) if (!append_nal(cursor)) return {};
+        return out;
+    }
+    if (codec_id == 12) {
+        // HEVCDecoderConfigurationRecord: numOfArrays is byte 22 of hvcC.
+        if (message.payload.size() < 28) return out;
+        std::size_t cursor = 27;
+        const auto array_count = static_cast<unsigned>(message.payload[cursor++]);
+        for (unsigned array = 0; array < array_count; ++array) {
+            if (cursor + 3 > message.payload.size()) return {};
+            ++cursor; // array_completeness + NAL unit type
+            const auto nal_count = static_cast<unsigned>((message.payload[cursor] << 8) | message.payload[cursor + 1]);
+            cursor += 2;
+            for (unsigned i = 0; i < nal_count; ++i) if (!append_nal(cursor)) return {};
+        }
+    }
+    return out;
 }
 
 struct AacConfig {
@@ -167,13 +370,12 @@ std::vector<std::uint8_t> make_pat(std::uint8_t continuity) {
     return packet;
 }
 
-std::vector<std::uint8_t> make_pmt(std::uint8_t continuity, otts::media::CodecId video_codec) {
+std::vector<std::uint8_t> make_pmt(std::uint8_t continuity, bool hevc_video) {
     std::vector<std::uint8_t> section = {
         0x02, 0xb0, 0x17, 0x00, 0x01, 0xc1, 0x00, 0x00,
         static_cast<std::uint8_t>(0xe0 | ((kVideoPid >> 8) & 0x1f)), static_cast<std::uint8_t>(kVideoPid & 0xff),
         0xf0, 0x00,
-        static_cast<std::uint8_t>(video_codec == otts::media::CodecId::Hevc ? 0x24 : 0x1b),
-        static_cast<std::uint8_t>(0xe0 | ((kVideoPid >> 8) & 0x1f)), static_cast<std::uint8_t>(kVideoPid & 0xff), 0xf0, 0x00,
+        static_cast<std::uint8_t>(hevc_video ? 0x24 : 0x1b), static_cast<std::uint8_t>(0xe0 | ((kVideoPid >> 8) & 0x1f)), static_cast<std::uint8_t>(kVideoPid & 0xff), 0xf0, 0x00,
         0x0f, static_cast<std::uint8_t>(0xe0 | ((kAudioPid >> 8) & 0x1f)), static_cast<std::uint8_t>(kAudioPid & 0xff), 0xf0, 0x00
     };
     const auto crc = crc32_mpeg(section.data(), section.size());
@@ -197,18 +399,14 @@ void write_pts(std::vector<std::uint8_t>& out, std::uint8_t prefix, std::uint64_
     out.push_back(static_cast<std::uint8_t>(((pts & 0x7f) << 1) | 1));
 }
 
-std::vector<std::uint8_t> make_pes_video(
-    const std::vector<std::uint8_t>& annexb,
-    std::uint32_t dts_ms,
-    std::uint32_t pts_ms) {
+std::vector<std::uint8_t> make_pes_video(const std::vector<std::uint8_t>& annexb, std::uint32_t timestamp_ms) {
     std::vector<std::uint8_t> pes;
     pes.insert(pes.end(), {0x00, 0x00, 0x01, kVideoStreamId});
     write_be16(pes, 0x0000);
     pes.push_back(0x80);
-    pes.push_back(0xc0);
-    pes.push_back(0x0a);
-    write_pts(pes, 0x03, static_cast<std::uint64_t>(pts_ms) * 90);
-    write_pts(pes, 0x01, static_cast<std::uint64_t>(dts_ms) * 90);
+    pes.push_back(0x80);
+    pes.push_back(0x05);
+    write_pts(pes, 0x02, static_cast<std::uint64_t>(timestamp_ms) * 90);
     pes.insert(pes.end(), annexb.begin(), annexb.end());
     return pes;
 }
@@ -263,15 +461,11 @@ struct PesPacket {
     std::uint16_t pid{0};
     std::uint8_t stream_id{0};
     std::uint32_t timestamp_ms{0};
-    std::uint32_t pts_ms{0};
-    std::uint32_t dts_ms{0};
     std::vector<std::uint8_t> payload;
 };
 
 class TsDemuxer {
 public:
-    otts::media::CodecId video_codec() const { return video_codec_; }
-
     std::vector<PesPacket> push(const std::uint8_t* data, std::size_t size) {
         std::vector<PesPacket> packets;
         buffer_.insert(buffer_.end(), data, data + size);
@@ -326,38 +520,6 @@ private:
             }
         }
         if (pid == kPatPid) {
-            if (payload_start && cursor < 188) {
-                const auto pointer = packet[cursor++];
-                cursor += pointer;
-            }
-            if (cursor + 12 <= 188 && packet[cursor] == 0x00) {
-                pmt_pid_ = static_cast<std::uint16_t>(((packet[cursor + 10] & 0x1f) << 8) | packet[cursor + 11]);
-            }
-            return;
-        }
-        if (pid == pmt_pid_) {
-            if (payload_start && cursor < 188) {
-                const auto pointer = packet[cursor++];
-                cursor += pointer;
-            }
-            if (cursor + 12 <= 188 && packet[cursor] == 0x02) {
-                const auto section_length = static_cast<std::size_t>(((packet[cursor + 1] & 0x0f) << 8) | packet[cursor + 2]);
-                const auto section_end = std::min<std::size_t>(188, cursor + 3 + section_length - 4);
-                const auto program_info_length = static_cast<std::size_t>(((packet[cursor + 10] & 0x0f) << 8) | packet[cursor + 11]);
-                auto entry = cursor + 12 + program_info_length;
-                while (entry + 5 <= section_end) {
-                    const auto stream_type = packet[entry];
-                    const auto info_length = static_cast<std::size_t>(((packet[entry + 3] & 0x0f) << 8) | packet[entry + 4]);
-                    // PMT PIDs are selected by the MPEG-TS muxer and are not fixed.
-                    // In particular, FFmpeg commonly assigns 0x101 to AAC, so using
-                    // our output PID as an ingest hint can overwrite HEVC with AVC.
-                    if (stream_type == 0x1b || stream_type == 0x24) {
-                        video_codec_ = stream_type == 0x24
-                            ? otts::media::CodecId::Hevc : otts::media::CodecId::Avc;
-                    }
-                    entry += 5 + info_length;
-                }
-            }
             return;
         }
         auto& state = pes_[pid];
@@ -383,25 +545,15 @@ private:
         if (payload_start > data.size()) {
             return;
         }
-        const auto decode_timestamp = [](const std::uint8_t* p) {
+        if ((flags & 0x80) && header_len >= 5) {
+            const auto* p = data.data() + 9;
             const std::uint64_t pts =
                 ((static_cast<std::uint64_t>((p[0] >> 1) & 0x07)) << 30) |
                 (static_cast<std::uint64_t>(p[1]) << 22) |
                 ((static_cast<std::uint64_t>((p[2] >> 1) & 0x7f)) << 15) |
                 (static_cast<std::uint64_t>(p[3]) << 7) |
                 static_cast<std::uint64_t>((p[4] >> 1) & 0x7f);
-            return pts;
-        };
-        if ((flags & 0x80) && header_len >= 5) {
-            const auto raw_pts = decode_timestamp(data.data() + 9);
-            auto raw_dts = raw_pts;
-            if ((flags & 0x40) && header_len >= 10) {
-                raw_dts = decode_timestamp(data.data() + 14);
-            }
-            if (!timeline_origin_.has_value()) timeline_origin_ = raw_dts;
-            packet.pts_ms = normalize_timestamp(raw_pts);
-            packet.dts_ms = normalize_timestamp(raw_dts);
-            packet.timestamp_ms = packet.dts_ms;
+            packet.timestamp_ms = static_cast<std::uint32_t>(pts / 90);
         }
         packet.payload.assign(data.begin() + static_cast<std::ptrdiff_t>(payload_start), data.end());
         while (!packet.payload.empty() && packet.payload.back() == 0xff) {
@@ -412,18 +564,6 @@ private:
 
     std::vector<std::uint8_t> buffer_;
     std::unordered_map<std::uint16_t, PesState> pes_;
-    std::optional<std::uint64_t> timeline_origin_;
-    otts::media::CodecId video_codec_{otts::media::CodecId::Unknown};
-    std::uint16_t pmt_pid_{kPmtPid};
-
-    std::uint32_t normalize_timestamp(std::uint64_t raw) const {
-        constexpr std::int64_t wrap = std::int64_t{1} << 33;
-        constexpr std::int64_t half_wrap = wrap / 2;
-        auto delta = static_cast<std::int64_t>(raw) - static_cast<std::int64_t>(*timeline_origin_);
-        if (delta > half_wrap) delta -= wrap;
-        if (delta < -half_wrap) delta += wrap;
-        return delta <= 0 ? 0 : static_cast<std::uint32_t>(delta / 90);
-    }
 };
 
 class H264TsExtractor {
@@ -580,6 +720,18 @@ int make_listener(std::uint16_t port) {
     }
     int yes = 1;
     srt_setsockopt(sock, 0, SRTO_REUSEADDR, &yes, sizeof(yes));
+    // Both the native muxer and ffplay/FFmpeg clients use SRT live mode. Set
+    // it explicitly on the listener; relying on the library default can leave
+    // the handshake waiting indefinitely on some libsrt builds.
+    int transtype = SRTT_LIVE;
+    srt_setsockopt(sock, 0, SRTO_TRANSTYPE, &transtype, sizeof(transtype));
+    // Allow a transient network stall without tearing down a long-running
+    // live connection. Accepted sockets inherit this listener option.
+    // Allow normal WAN jitter/reconnect gaps without dropping a long-running
+    // live session. The send/receive loops still have their own finite I/O
+    // timeouts and clean up broken peers explicitly.
+    int peer_idle_timeout_ms = 120000;
+    srt_setsockopt(sock, 0, SRTO_PEERIDLETIMEO, &peer_idle_timeout_ms, sizeof(peer_idle_timeout_ms));
     sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = INADDR_ANY;
@@ -595,79 +747,50 @@ int make_listener(std::uint16_t port) {
     return sock;
 }
 
-std::string trim_copy(std::string value) {
-    if (const auto null_pos = value.find('\0'); null_pos != std::string::npos) {
-        value.resize(null_pos);
-    }
-    const auto first = value.find_first_not_of(" \t\r\n\0", 0);
-    if (first == std::string::npos) {
-        return {};
-    }
-    const auto last = value.find_last_not_of(" \t\r\n\0");
-    return value.substr(first, last - first + 1);
-}
-
-std::string normalize_stream_key(std::string value) {
-    value = trim_copy(std::move(value));
-    while (!value.empty() && value.front() == '/') {
-        value.erase(value.begin());
-    }
-    if (value.size() > 4 && value.substr(value.size() - 4) == ".sdp") {
-        value.resize(value.size() - 4);
-    }
-    const auto separator = value.find("__");
-    if (separator != std::string::npos && value.find('/') == std::string::npos) {
-        value.replace(separator, 2, "/");
-    }
-    return value;
-}
-
-std::string parse_stream_id(std::string stream_id) {
-    stream_id = trim_copy(std::move(stream_id));
-    if (stream_id.empty()) {
-        return {};
-    }
-    if (stream_id.rfind("#!::", 0) == 0) {
-        stream_id.erase(0, 4);
-        std::stringstream fields(stream_id);
-        std::string field;
-        while (std::getline(fields, field, ',')) {
-            if (field.rfind("r=", 0) == 0 || field.rfind("stream=", 0) == 0) {
-                const auto equals = field.find('=');
-                return normalize_stream_key(field.substr(equals + 1));
-            }
-        }
-        return {};
-    }
-    if (stream_id.find("app=") != std::string::npos && stream_id.find("stream=") != std::string::npos) {
-        std::string app;
-        std::string name;
-        std::stringstream fields(stream_id);
-        std::string field;
-        while (std::getline(fields, field, '&')) {
-            if (field.rfind("app=", 0) == 0) {
-                app = field.substr(4);
-            } else if (field.rfind("stream=", 0) == 0) {
-                name = field.substr(7);
-            }
-        }
-        if (!app.empty() && !name.empty()) {
-            return normalize_stream_key(app + "/" + name);
-        }
-    }
-    return normalize_stream_key(std::move(stream_id));
-}
-
 std::string stream_key_from_socket(int socket, const std::string& fallback) {
     std::array<char, 512> buffer{};
     int length = static_cast<int>(buffer.size());
-    if (srt_getsockflag(socket, SRTO_STREAMID, buffer.data(), &length) != SRT_ERROR && length > 0) {
-        auto stream_key = parse_stream_id(std::string(buffer.data(), static_cast<std::size_t>(length)));
-        if (!stream_key.empty()) {
-            return stream_key;
+    if (srt_getsockflag(socket, SRTO_STREAMID, buffer.data(), &length) == SRT_ERROR || length <= 0) {
+        return fallback.empty() ? std::string("live/srt-demo") : fallback;
+    }
+
+    std::string stream_id(buffer.data(), static_cast<std::size_t>(length));
+    if (const auto nul = stream_id.find('\0'); nul != std::string::npos) {
+        stream_id.resize(nul);
+    }
+    if (stream_id.rfind("#!::", 0) == 0) {
+        const auto route = stream_id.find("r=");
+        if (route != std::string::npos) {
+            const auto begin = route + 2;
+            const auto end = stream_id.find(',', begin);
+            stream_id = stream_id.substr(begin, end == std::string::npos ? std::string::npos : end - begin);
         }
     }
-    return fallback.empty() ? std::string("live/srt-demo") : fallback;
+    while (!stream_id.empty() && stream_id.front() == '/') {
+        stream_id.erase(stream_id.begin());
+    }
+    std::string decoded;
+    decoded.reserve(stream_id.size());
+    auto hex_value = [](char ch) -> int {
+        if (ch >= '0' && ch <= '9') return ch - '0';
+        if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+        if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+        return -1;
+    };
+    for (std::size_t i = 0; i < stream_id.size(); ++i) {
+        if (stream_id[i] == '%' && i + 2 < stream_id.size()) {
+            const int hi = hex_value(stream_id[i + 1]);
+            const int lo = hex_value(stream_id[i + 2]);
+            if (hi >= 0 && lo >= 0) {
+                decoded.push_back(static_cast<char>((hi << 4) | lo));
+                i += 2;
+                continue;
+            }
+        }
+        decoded.push_back(stream_id[i]);
+    }
+    stream_id = std::move(decoded);
+    return stream_id.empty() ? (fallback.empty() ? std::string("live/srt-demo") : fallback) : stream_id;
 }
 
 }  // namespace
@@ -768,21 +891,8 @@ void SrtNativeServer::play_loop() {
 }
 
 void SrtNativeServer::handle_publish_client(int socket) {
-    int receive_timeout_ms = 5000;
-    srt_setsockopt(socket, 0, SRTO_RCVTIMEO, &receive_timeout_ms, sizeof(receive_timeout_ms));
     const auto stream_key = stream_key_from_socket(socket, publish_stream_key_);
-    {
-        std::lock_guard<std::mutex> lock(publishers_mutex_);
-        const auto existing = active_publishers_.find(stream_key);
-        if (existing != active_publishers_.end() && existing->second != socket) {
-            otts::core::log_warn("srt_native", "replacing existing publisher key=" + stream_key);
-            srt_close(existing->second);
-        }
-        active_publishers_[stream_key] = socket;
-    }
-    const auto session_key = "cpp-srt-publish:" + stream_key + ":" + std::to_string(socket);
-    otts::core::log_info("srt_native", "publish client routed to key=" + stream_key);
-    registry_.begin_external_publish(stream_key, otts::media::StreamSource::Srt, "cpp-srt-native-publish");
+    const auto session_key = "cpp-srt-publish:" + stream_key;
     registry_.upsert_external_stream(stream_key, otts::media::StreamSource::Srt, "aac", "h264", "cpp-srt-native-publish", true);
     registry_.upsert_external_session(
         session_key,
@@ -805,26 +915,25 @@ void SrtNativeServer::handle_publish_client(int socket) {
         0,
         "");
 
+    H264TsExtractor video_demuxer;
     TsDemuxer pes_demuxer;
     std::array<std::uint8_t, 8192> buffer{};
     bool sent_sequence = false;
     bool sent_aac_sequence = false;
-    otts::media::CodecId video_codec = otts::media::CodecId::Unknown;
-    otts::codec::ParameterSets known_sets;
+    NalSets known_sets;
     while (running_.load()) {
         const auto n = srt_recvmsg(socket, reinterpret_cast<char*>(buffer.data()), static_cast<int>(buffer.size()));
         if (n <= 0) {
             otts::core::log_warn("srt_native", "publish recv ended key=" + stream_key + " err=" + srt_getlasterror_str());
             break;
         }
-        auto pes_packets = pes_demuxer.push(buffer.data(), static_cast<std::size_t>(n));
-        if (pes_demuxer.video_codec() != otts::media::CodecId::Unknown) {
-            video_codec = pes_demuxer.video_codec();
-        }
-        for (const auto& pes : pes_packets) {
-            if ((pes.stream_id & 0xe0) == 0xc0 && !pes.payload.empty()) {
-                std::size_t cursor = 0;
-                while (cursor + 7 <= pes.payload.size()) {
+        auto audio_pes_packets = pes_demuxer.push(buffer.data(), static_cast<std::size_t>(n));
+        for (const auto& pes : audio_pes_packets) {
+            if ((pes.stream_id & 0xe0) != 0xc0 || pes.payload.empty()) {
+                continue;
+            }
+            std::size_t cursor = 0;
+            while (cursor + 7 <= pes.payload.size()) {
                 const auto frame_length = adts_frame_length(pes.payload.data() + cursor, pes.payload.size() - cursor);
                 if (frame_length < 7 || cursor + frame_length > pes.payload.size()) {
                     break;
@@ -844,56 +953,30 @@ void SrtNativeServer::handle_publish_client(int socket) {
                     "cpp-srt-native-publish",
                     make_aac_raw_message(pes.timestamp_ms, pes.payload.data() + cursor + 7, frame_length - 7));
                 cursor += frame_length;
-                }
-                continue;
             }
+        }
+
+        auto video_pes_packets = video_demuxer.push(buffer.data(), static_cast<std::size_t>(n));
+        for (const auto& pes : video_pes_packets) {
             if ((pes.stream_id & 0xf0) != 0xe0 || pes.payload.empty()) {
                 continue;
             }
-            auto hevc_sets = otts::codec::extract_parameter_sets(pes.payload, otts::media::CodecId::Hevc);
-            auto avc_sets = otts::codec::extract_parameter_sets(pes.payload, otts::media::CodecId::Avc);
-            if (video_codec == otts::media::CodecId::Unknown && hevc_sets.complete(otts::media::CodecId::Hevc)) {
-                video_codec = otts::media::CodecId::Hevc;
-            } else if (avc_sets.complete(otts::media::CodecId::Avc) && video_codec == otts::media::CodecId::Unknown) {
-                video_codec = otts::media::CodecId::Avc;
-            }
-            if (video_codec == otts::media::CodecId::Unknown) {
-                continue;
-            }
-            auto& sets = video_codec == otts::media::CodecId::Hevc ? hevc_sets : avc_sets;
-            if (!sets.vps.empty()) {
-                known_sets.vps = std::move(sets.vps);
-            }
+            auto sets = extract_parameter_sets(pes.payload);
             if (!sets.sps.empty()) {
                 known_sets.sps = std::move(sets.sps);
             }
             if (!sets.pps.empty()) {
                 known_sets.pps = std::move(sets.pps);
             }
-            if (!sent_sequence && known_sets.complete(video_codec)) {
-                otts::rtmp::MediaMessage config;
-                config.timestamp = pes.timestamp_ms;
-                config.type_id = 9;
-                config.payload = otts::codec::make_flv_video_config(video_codec, known_sets);
+            if (!sent_sequence && !known_sets.sps.empty() && !known_sets.pps.empty()) {
                 registry_.publish_external_media(
                     stream_key,
                     otts::media::StreamSource::Srt,
                     "cpp-srt-native-publish",
-                    config);
-                registry_.upsert_external_stream(
-                    stream_key, otts::media::StreamSource::Srt, "aac", otts::media::to_string(video_codec),
-                    "cpp-srt-native-publish", true);
+                    make_avc_sequence_header(pes.timestamp_ms, known_sets));
                 sent_sequence = true;
             }
-            otts::rtmp::MediaMessage media;
-            media.timestamp = pes.timestamp_ms;
-            media.type_id = 9;
-            const auto composition_time = static_cast<std::int64_t>(pes.pts_ms) - pes.dts_ms;
-            media.payload = otts::codec::make_flv_video_sample(
-                video_codec,
-                pes.payload,
-                otts::codec::is_keyframe(pes.payload, video_codec),
-                static_cast<std::int32_t>(std::clamp<std::int64_t>(composition_time, -8388608, 8388607)));
+            auto media = make_avc_nalu_message(pes.timestamp_ms, pes.payload, has_idr(pes.payload));
             if (media.payload.size() > 5) {
                 registry_.publish_external_media(stream_key, otts::media::StreamSource::Srt, "cpp-srt-native-publish", media);
             }
@@ -916,29 +999,30 @@ void SrtNativeServer::handle_publish_client(int socket) {
             }
         }
     }
+    for (const auto& pes : video_demuxer.flush()) {
+        if ((pes.stream_id & 0xf0) == 0xe0 && !pes.payload.empty()) {
+            auto media = make_avc_nalu_message(pes.timestamp_ms, pes.payload, has_idr(pes.payload));
+            if (media.payload.size() > 5) {
+                registry_.publish_external_media(stream_key, otts::media::StreamSource::Srt, "cpp-srt-native-publish", media);
+            }
+        }
+    }
     registry_.remove_external_session(session_key);
-    bool still_owner = false;
-    {
-        std::lock_guard<std::mutex> lock(publishers_mutex_);
-        const auto current = active_publishers_.find(stream_key);
-        still_owner = current != active_publishers_.end() && current->second == socket;
-        if (still_owner) active_publishers_.erase(current);
-    }
-    if (still_owner) {
-        registry_.remove_external_stream(stream_key, otts::media::StreamSource::Srt);
-    }
+    registry_.remove_external_stream(stream_key, otts::media::StreamSource::Srt);
     srt_close(socket);
 }
 
 void SrtNativeServer::handle_play_client(int socket) {
+    int send_timeout_ms = 5000;
+    srt_setsockopt(socket, 0, SRTO_SNDTIMEO, &send_timeout_ms, sizeof(send_timeout_ms));
     const auto stream_key = stream_key_from_socket(socket, publish_stream_key_);
-    const auto session_key = "cpp-srt-play:" + stream_key + ":" + std::to_string(socket);
-    otts::core::log_info("srt_native", "play client routed to key=" + stream_key);
+    const auto session_key = "cpp-srt-play:" + std::to_string(now_epoch_ms());
     std::mutex mutex;
     std::condition_variable cv;
     std::deque<otts::rtmp::MediaMessage> queue;
     bool alive = true;
-    const auto callback_id = next_callback_id();
+    const auto callback_id = static_cast<otts::rtmp::StreamRegistry::CallbackId>(now_epoch_ms());
+    registry_.update_external_viewers(stream_key, otts::media::StreamSource::Srt, "cpp-srt-native-play", 1);
     registry_.upsert_external_session(
         session_key,
         stream_key,
@@ -964,10 +1048,7 @@ void SrtNativeServer::handle_play_client(int socket) {
             return;
         }
         std::lock_guard<std::mutex> lock(mutex);
-        // The registry snapshot can contain sequence headers plus a 512-packet
-        // GOP. Keep the complete startup snapshot so late SRT clients never
-        // lose SPS/PPS or the keyframe at the front of the GOP.
-        if (queue.size() >= 1024) {
+        if (queue.size() > 256) {
             queue.pop_front();
         }
         queue.push_back(message);
@@ -978,16 +1059,28 @@ void SrtNativeServer::handle_play_client(int socket) {
     std::uint8_t pmt_cc = 0;
     std::uint8_t video_cc = 0;
     std::uint8_t audio_cc = 0;
+    bool hevc_video = false;
     AacConfig aac_config;
-    std::vector<std::uint8_t> avc_config;
-    otts::media::CodecId video_codec = otts::media::CodecId::Unknown;
-    for (const auto& stream : registry_.snapshots()) {
-        if (stream.stream_key == stream_key && stream.video_codec == "h265") {
-            video_codec = otts::media::CodecId::Hevc;
+    int sent_count = 0;
+    bool video_codec_known = false;
+    for (const auto& snapshot : registry_.snapshots()) {
+        if (snapshot.stream_key == stream_key && snapshot.video_codec == "h265") {
+            hevc_video = true;
+            video_codec_known = true;
             break;
         }
     }
-    int sent_count = 0;
+    std::vector<std::uint8_t> video_parameter_sets;
+    // Seed VPS/SPS/PPS from the registry GOP cache before consuming live frames.
+    // A late SRT caller must never receive HEVC slices ahead of its decoder config.
+    for (const auto& cached : registry_.cached_messages(stream_key)) {
+        if (cached.type_id != 9) continue;
+        const auto parsed = otts::codec::parse_flv_video_packet(cached.payload);
+        if (parsed && parsed->sequence_header) {
+            auto config = otts::codec::flv_video_config_to_annexb(cached.payload);
+            if (!config.empty()) video_parameter_sets = std::move(config);
+        }
+    }
     while (running_.load()) {
         otts::rtmp::MediaMessage message;
         {
@@ -1006,48 +1099,42 @@ void SrtNativeServer::handle_play_client(int socket) {
             }
             continue;
         }
-        if (message.type_id == 9) {
-            const auto packet = otts::codec::parse_flv_video_packet(message.payload);
-            if (packet && packet->sequence_header) {
-                video_codec = packet->codec;
-                auto parsed = otts::codec::flv_video_config_to_annexb(message.payload);
-            if (!parsed.empty()) {
-                avc_config = std::move(parsed);
-            }
-            continue;
+        if (message.type_id == 9 && !message.payload.empty()) {
+            const auto parsed = otts::codec::parse_flv_video_packet(message.payload);
+            if (parsed && (parsed->codec == otts::media::CodecId::Avc || parsed->codec == otts::media::CodecId::Hevc)) {
+                hevc_video = parsed->codec == otts::media::CodecId::Hevc;
+                video_codec_known = true;
+                if (parsed->sequence_header) {
+                    auto config = otts::codec::flv_video_config_to_annexb(message.payload);
+                    if (!config.empty()) video_parameter_sets = std::move(config);
+                    continue;
+                }
             }
         }
-        if (message.type_id == 9) {
-            const auto packet = otts::codec::parse_flv_video_packet(message.payload);
-            if (packet) video_codec = packet->codec;
+        // Do not publish a PMT with the wrong video stream type merely because
+        // an audio frame arrived before the first video configuration packet.
+        if (!video_codec_known) {
+            continue;
         }
         std::vector<std::uint8_t> out;
-        if (video_codec != otts::media::CodecId::Unknown && (sent_count++ % 30) == 0) {
+        if ((sent_count++ % 30) == 0) {
             auto pat = make_pat(pat_cc++);
-            auto pmt = make_pmt(pmt_cc++, video_codec);
+            auto pmt = make_pmt(pmt_cc++, hevc_video);
             out.insert(out.end(), pat.begin(), pat.end());
             out.insert(out.end(), pmt.begin(), pmt.end());
         }
         if (message.type_id == 9) {
+            if (video_parameter_sets.empty()) continue;
             auto annexb = otts::codec::flv_video_sample_to_annexb(message.payload);
             if (annexb.empty()) {
                 continue;
             }
-            const auto packet = otts::codec::parse_flv_video_packet(message.payload);
-            const bool keyframe = packet && packet->keyframe;
-            if (keyframe && !avc_config.empty()) {
-                std::vector<std::uint8_t> configured;
-                configured.reserve(avc_config.size() + annexb.size());
-                configured.insert(configured.end(), avc_config.begin(), avc_config.end());
-                configured.insert(configured.end(), annexb.begin(), annexb.end());
-                annexb = std::move(configured);
+            const auto parsed = otts::codec::parse_flv_video_packet(message.payload);
+            const bool keyframe = parsed && parsed->keyframe;
+            if (!video_parameter_sets.empty() && (keyframe || video_parameter_sets.size() > 0)) {
+                annexb.insert(annexb.begin(), video_parameter_sets.begin(), video_parameter_sets.end());
             }
-            const auto pts = static_cast<std::int64_t>(message.timestamp) +
-                (packet ? packet->composition_time_ms : 0);
-            auto pes = make_pes_video(
-                annexb,
-                message.timestamp,
-                static_cast<std::uint32_t>(std::max<std::int64_t>(0, pts)));
+            auto pes = make_pes_video(annexb, message.timestamp);
             auto ts = packetize_ts(kVideoPid, pes, video_cc);
             out.insert(out.end(), ts.begin(), ts.end());
         } else if (message.type_id == 8) {
@@ -1068,6 +1155,9 @@ void SrtNativeServer::handle_play_client(int socket) {
                 -1,
                 0);
             if (sent == SRT_ERROR) {
+                otts::core::log_warn(
+                    "srt_native",
+                    "play send ended key=" + stream_key + " err=" + srt_getlasterror_str());
                 alive = false;
                 break;
             }
@@ -1079,6 +1169,7 @@ void SrtNativeServer::handle_play_client(int socket) {
     }
     alive = false;
     registry_.remove_callback_subscriber(stream_key, callback_id);
+    registry_.update_external_viewers(stream_key, otts::media::StreamSource::Srt, "cpp-srt-native-play", 0);
     registry_.remove_external_session(session_key);
     srt_close(socket);
 }

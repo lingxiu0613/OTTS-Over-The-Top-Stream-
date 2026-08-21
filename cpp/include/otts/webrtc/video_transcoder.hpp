@@ -14,6 +14,17 @@ struct TranscodedVideoFrame {
     bool keyframe{false};
 };
 
+struct VideoTranscodeSettings {
+    std::uint32_t bit_rate{2500000};
+    std::uint32_t frame_rate{30};
+    std::uint32_t gop_size{60};
+    std::string encoder_name{"libx264"};
+    std::string preset{"ultrafast"};
+    std::string tune{"zerolatency"};
+
+    std::string cache_key() const;
+};
+
 class VideoTranscoder {
 public:
     ~VideoTranscoder();
@@ -21,6 +32,9 @@ public:
     VideoTranscoder& operator=(const VideoTranscoder&) = delete;
 
     static std::unique_ptr<VideoTranscoder> create_hevc_to_avc(std::string& error);
+    static std::unique_ptr<VideoTranscoder> create_hevc_to_avc(
+        const VideoTranscodeSettings& settings,
+        std::string& error);
     std::vector<TranscodedVideoFrame> transcode(
         const std::uint8_t* data,
         std::size_t size,

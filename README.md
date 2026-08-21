@@ -543,8 +543,11 @@ Build directories, local configuration, test media, archives, logs,
   HEVC-to-H.264 fallback. Audio is converted between WebRTC Opus and core AAC.
 - The tested HEVC profile is 8-bit 4:2:0. Client support for Enhanced RTMP,
   HTTP-FLV HEVC, and WebRTC HEVC varies by player, browser, OS, and GPU.
-- The native HEVC-to-H.264 fallback is per WHEP session and prioritizes low
-  latency over encoding efficiency; shared transcoder pooling is future work.
+- Native HEVC-to-H.264 fallback is pooled by stream and transcode settings.
+  One HEVC decoder and one H.264 encoder feed a shared encoded GOP cache; each
+  WHEP session keeps independent RTP/RTCP, SSRC, congestion control, and send
+  queue state. A different bitrate, frame rate, GOP, or encoder profile creates
+  a separate shared pipeline.
 - Direct H.265 WHEP is intended for low-delay HEVC without B-frames. Use the
   default H.264 WHEP preference for file-oriented HEVC containing B-frames.
 - Cluster forwarding, replay, and production certificate automation remain

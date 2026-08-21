@@ -99,6 +99,7 @@ if (OTTS_ENABLE_WEBRTC_DATACHANNEL)
     find_library(USRSCTP_LIBRARY NAMES usrsctp REQUIRED)
     target_sources(otts_rtmp PRIVATE
         cpp/src/webrtc/audio_transcoder.cpp
+        cpp/src/webrtc/shared_video_transcoder.cpp
         cpp/src/webrtc/video_transcoder.cpp)
     target_compile_definitions(otts_rtmp PRIVATE OTTS_WEBRTC_DATACHANNEL=1)
     target_include_directories(otts_rtmp SYSTEM PRIVATE

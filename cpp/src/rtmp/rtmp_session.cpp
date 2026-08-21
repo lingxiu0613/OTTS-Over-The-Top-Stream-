@@ -573,6 +573,12 @@ void RtmpSession::on_fc_publish(const std::vector<Amf0Value>& values) {
 void RtmpSession::on_fc_unpublish(const std::vector<Amf0Value>& values) {
     const auto transaction_id = values.size() > 1 ? as_number(values[1]) : 0.0;
     otts::core::log_info("rtmp_session", "handle FCUnpublish txn=" + std::to_string(transaction_id));
+    // OBS and several encoders send FCUnpublish before closing the TCP session.
+    // Release the registry slot immediately so a later publisher can reuse the key.
+    if (is_publisher_) {
+        registry_.unregister_publisher(shared_from_this());
+        is_publisher_ = false;
+    }
     send_simple_result(transaction_id, Amf0Null{});
 }
 
@@ -852,12 +858,17 @@ bool RtmpSession::send_chunked_message(std::uint32_t chunk_stream_id, const Medi
             write_be24(out, static_cast<std::uint32_t>(message.payload.size()));
             out.push_back(message.type_id);
             write_le32(out, message.message_stream_id);
-            if (message.timestamp >= 0xFFFFFF) {
-                out.push_back(static_cast<std::uint8_t>((message.timestamp >> 24) & 0xFF));
-                out.push_back(static_cast<std::uint8_t>((message.timestamp >> 16) & 0xFF));
-                out.push_back(static_cast<std::uint8_t>((message.timestamp >> 8) & 0xFF));
-                out.push_back(static_cast<std::uint8_t>(message.timestamp & 0xFF));
-            }
+        }
+
+        // When the timestamp field is 0xFFFFFF, RTMP requires the four-byte
+        // extended timestamp after every chunk header, including fmt=3
+        // continuation chunks. Omitting it there shifts the payload boundary
+        // once a stream has run for about 4h39m and corrupts all large packets.
+        if (message.timestamp >= 0xFFFFFF) {
+            out.push_back(static_cast<std::uint8_t>((message.timestamp >> 24) & 0xFF));
+            out.push_back(static_cast<std::uint8_t>((message.timestamp >> 16) & 0xFF));
+            out.push_back(static_cast<std::uint8_t>((message.timestamp >> 8) & 0xFF));
+            out.push_back(static_cast<std::uint8_t>(message.timestamp & 0xFF));
         }
 
         const std::size_t remaining = message.payload.size() - offset;

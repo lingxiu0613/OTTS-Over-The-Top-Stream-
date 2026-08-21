@@ -78,7 +78,6 @@
       }
 
       input,
-      select,
       button,
       pre,
       video {
@@ -87,19 +86,12 @@
         border-radius: 6px;
       }
 
-      input,
-      select {
+      input {
         padding: 10px 12px;
         border: 1px solid var(--line);
         background: #ffffff;
         color: var(--text);
         overflow-wrap: anywhere;
-      }
-
-      select {
-        width: 100%;
-        box-sizing: border-box;
-        border-radius: 6px;
       }
 
       button {
@@ -171,13 +163,6 @@
           <p><input id="whipStreamKey" value="live/webrtc-demo" /></p>
           <label class="field-label" for="whipPublishUrl">WHIP Publish URL</label>
           <p><input id="whipPublishUrl" value="" /></p>
-          <label class="field-label" for="whipVideoCodec">Video Codec Preference</label>
-          <p>
-            <select id="whipVideoCodec">
-              <option value="h264" selected>H.264 (stable browser default)</option>
-              <option value="h265">H.265 (direct, browser support required)</option>
-            </select>
-          </p>
           <button id="startPublish">Start WHIP Publish</button>
           <button id="stopPublish" class="secondary">Stop Publish</button>
           <video id="localVideo" autoplay muted playsinline></video>
@@ -190,18 +175,12 @@
           <p><input id="whepStreamKey" value="live/webrtc-demo" /></p>
           <label class="field-label" for="whepPlayUrl">WHEP Play URL</label>
           <p><input id="whepPlayUrl" value="" /></p>
-          <label class="field-label" for="whepVideoCodec">Video Codec Preference</label>
-          <p>
-            <select id="whepVideoCodec">
-              <option value="h264" selected>H.264 (stable, converts HEVC when needed)</option>
-              <option value="h265">H.265 (direct, use low-delay streams without B-frames)</option>
-            </select>
-          </p>
+          <label class="field-label" for="whepCodec">Video Codec</label>
+          <p><select id="whepCodec"><option value="h264" selected>H.264 (兼容浏览器)</option><option value="h265">H.265 / HEVC</option><option value="auto">自动协商</option></select></p>
           <button id="startPlay">Start WHEP Play</button>
           <button id="stopPlay" class="secondary">Stop Play</button>
           <video id="remoteVideo" autoplay playsinline controls></video>
           <p class="muted" id="playStatus">Idle</p>
-          <p class="muted" id="playStats">Video statistics will appear during playback.</p>
         </div>
       </div>
 
@@ -218,6 +197,7 @@
       const whepStreamKeyInput = document.getElementById("whepStreamKey");
       const whipPublishUrlInput = document.getElementById("whipPublishUrl");
       const whepPlayUrlInput = document.getElementById("whepPlayUrl");
+      const whepCodecInput = document.getElementById("whepCodec");
 
       let publishPc = null;
       let publishStream = null;
@@ -227,8 +207,6 @@
       let playStream = null;
       let playSessionUrl = null;
       let nativeRuntime = null;
-      let playStatsTimer = null;
-      let previousVideoStats = null;
 
       function updateSecurityHint() {
         const hint = document.getElementById("securityHint");
@@ -273,7 +251,7 @@
         }
       }
 
-      function setVideoCodecPreference(transceiver, preferredCodec) {
+      function preferH264(transceiver) {
         if (!transceiver || typeof transceiver.setCodecPreferences !== "function") {
           return;
         }
@@ -281,24 +259,38 @@
         if (!capabilities || !Array.isArray(capabilities.codecs)) {
           return;
         }
-        const h265 = capabilities.codecs.filter((codec) => /^video\/(h265|hevc)$/i.test(codec.mimeType));
         const h264 = capabilities.codecs.filter((codec) => /^video\/h264$/i.test(codec.mimeType));
-        if (!h265.length && !h264.length) {
+        if (!h264.length) {
           return;
         }
-        const rest = capabilities.codecs.filter(
-          (codec) => !/^video\/(h264|h265|hevc)$/i.test(codec.mimeType)
-        );
-        const preferred = preferredCodec === "h265" ? [...h265, ...h264] : [...h264, ...h265];
-        transceiver.setCodecPreferences([...preferred, ...rest]);
+        const rest = capabilities.codecs.filter((codec) => !/^video\/h264$/i.test(codec.mimeType));
+        transceiver.setCodecPreferences([...h264, ...rest]);
+      }
+
+      function preferSelectedVideoCodec(transceiver) {
+        if (!transceiver || typeof transceiver.setCodecPreferences !== "function") return;
+        const capabilities = RTCRtpSender.getCapabilities?.("video");
+        if (!capabilities?.codecs?.length) return;
+        const mode = whepCodecInput?.value || "h264";
+        if (mode === "auto") {
+          transceiver.setCodecPreferences(capabilities.codecs);
+          return;
+        }
+        const wanted = mode === "h265" ? /^(video\/h265|video\/hevc)$/i : /^video\/h264$/i;
+        const selected = capabilities.codecs.filter((codec) => wanted.test(codec.mimeType));
+        if (selected.length) transceiver.setCodecPreferences(selected);
       }
 
       function buildWhipUrl(streamKey) {
-        return `${proxyBase}/whip/v1?stream_key=${encodeURIComponent(streamKey)}`;
+        return `${proxyBase}/whip/v1?stream_key=${streamKey}`;
       }
 
       function buildWhepUrl(streamKey) {
-        return `${proxyBase}/whep/v1?stream_key=${encodeURIComponent(streamKey)}`;
+        return `${proxyBase}/whep/v1?stream_key=${streamKey}`;
+      }
+
+      function buildNativeWhepOfferUrl(streamKey) {
+        return `${proxyBase}/whep/offer/v1?stream_key=${streamKey}`;
       }
 
       function normalizeWebRtcUrl(rawUrl, fallbackUrl) {
@@ -357,7 +349,7 @@
 
       function syncPlayUrl() {
         const streamKey = whepStreamKeyInput.value.trim() || "live/webrtc-demo";
-        whepPlayUrlInput.value = buildWhepUrl(streamKey);
+        whepPlayUrlInput.value = isNativeRuntime() ? buildNativeWhepOfferUrl(streamKey) : buildWhepUrl(streamKey);
       }
 
       function getPublishTarget() {
@@ -395,71 +387,6 @@
         }
       }
 
-      function stopPlayStats() {
-        if (playStatsTimer) {
-          clearInterval(playStatsTimer);
-          playStatsTimer = null;
-        }
-        previousVideoStats = null;
-      }
-
-      async function updatePlayStats() {
-        if (!playPc) {
-          return;
-        }
-        try {
-          const reports = await playPc.getStats();
-          let video = null;
-          reports.forEach((report) => {
-            if (
-              report.type === "inbound-rtp" &&
-              !report.isRemote &&
-              (report.kind === "video" || report.mediaType === "video")
-            ) {
-              video = report;
-            }
-          });
-          if (!video) {
-            return;
-          }
-
-          const elapsedSeconds = previousVideoStats
-            ? Math.max(0.001, (video.timestamp - previousVideoStats.timestamp) / 1000)
-            : 0;
-          const bitrateKbps = previousVideoStats && video.bytesReceived >= previousVideoStats.bytesReceived
-            ? ((video.bytesReceived - previousVideoStats.bytesReceived) * 8) / elapsedSeconds / 1000
-            : 0;
-          const measuredFps = previousVideoStats && video.framesDecoded >= previousVideoStats.framesDecoded
-            ? (video.framesDecoded - previousVideoStats.framesDecoded) / elapsedSeconds
-            : 0;
-          const fps = Number(video.framesPerSecond || measuredFps || 0);
-          const jitterMs = Number(video.jitter || 0) * 1000;
-          const bufferMs = video.jitterBufferEmittedCount
-            ? (Number(video.jitterBufferDelay || 0) / video.jitterBufferEmittedCount) * 1000
-            : 0;
-          const width = video.frameWidth || document.getElementById("remoteVideo").videoWidth || 0;
-          const height = video.frameHeight || document.getElementById("remoteVideo").videoHeight || 0;
-          document.getElementById("playStats").textContent =
-            `${width}x${height} | decode ${fps.toFixed(1)} fps | ` +
-            `${bitrateKbps.toFixed(0)} kbps | lost ${video.packetsLost || 0} | ` +
-            `dropped ${video.framesDropped || 0} | jitter ${jitterMs.toFixed(1)} ms | ` +
-            `buffer ${bufferMs.toFixed(1)} ms`;
-          previousVideoStats = {
-            timestamp: video.timestamp,
-            bytesReceived: video.bytesReceived || 0,
-            framesDecoded: video.framesDecoded || 0
-          };
-        } catch (error) {
-          document.getElementById("playStats").textContent = `Statistics unavailable: ${error.message}`;
-        }
-      }
-
-      function startPlayStats() {
-        stopPlayStats();
-        updatePlayStats();
-        playStatsTimer = setInterval(updatePlayStats, 1000);
-      }
-
       async function startPublish() {
         const { streamKey, url } = getPublishTarget();
         if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
@@ -488,10 +415,7 @@
             streams: [publishStream],
             sendEncodings: [{ maxBitrate: 2500000, maxFramerate: 30 }]
           });
-          setVideoCodecPreference(
-            videoTransceiver,
-            document.getElementById("whipVideoCodec").value
-          );
+          preferH264(videoTransceiver);
           const parameters = videoTransceiver.sender.getParameters();
           parameters.degradationPreference = "maintain-framerate";
           if (!parameters.encodings || !parameters.encodings.length) {
@@ -548,7 +472,13 @@
         if (playPc || playSessionUrl) {
           await stopPlay();
         }
-        const { streamKey, url } = getPlayTarget();
+        let { streamKey, url } = getPlayTarget();
+        // Explicit H.265 uses normal WHEP POST negotiation. The native offer
+        // endpoint is a GET-offer/POST-answer H.264 compatibility endpoint.
+        if ((whepCodecInput?.value || "h264") === "h265") {
+          url = buildWhepUrl(streamKey);
+          whepPlayUrlInput.value = url;
+        }
         playPc = new RTCPeerConnection();
         playStream = new MediaStream();
         const remoteVideo = document.getElementById("remoteVideo");
@@ -563,10 +493,44 @@
         };
 
         await ensureRuntimeStatus();
-        setVideoCodecPreference(
-          playPc.addTransceiver("video", { direction: "recvonly" }),
-          document.getElementById("whepVideoCodec").value
-        );
+        // Native offer is the compatibility path for H.264. For an explicit
+        // H.265 request use the negotiated WHEP endpoint so the browser offer
+        // actually contains HEVC instead of silently receiving an H.264 offer.
+        const selectedCodec = whepCodecInput?.value || "h264";
+        if (isNativeRuntime() && selectedCodec !== "h265") {
+          const offerUrl = buildNativeWhepOfferUrl(streamKey);
+          const offerResponse = await fetch(offerUrl, { method: "GET" });
+          if (!offerResponse.ok) {
+            const text = await offerResponse.text();
+            throw new Error(text || `native WHEP offer failed: ${offerResponse.status}`);
+          }
+          const offerSdp = await offerResponse.text();
+          const location = offerResponse.headers.get("Location");
+          playSessionUrl = location ? `${proxyBase}${location}` : null;
+          if (!playSessionUrl) {
+            throw new Error("native WHEP offer did not return a session URL");
+          }
+
+          await playPc.setRemoteDescription({ type: "offer", sdp: offerSdp });
+          const answer = await playPc.createAnswer();
+          await playPc.setLocalDescription(answer);
+          await waitIceComplete(playPc);
+
+          const answerResponse = await fetch(`${playSessionUrl}/answer`, {
+            method: "POST",
+            headers: { "Content-Type": "application/sdp" },
+            body: playPc.localDescription.sdp
+          });
+          if (!answerResponse.ok) {
+            const text = await answerResponse.text();
+            throw new Error(text || `native WHEP answer failed: ${answerResponse.status}`);
+          }
+          document.getElementById("playStatus").textContent = `Playing ${streamKey}`;
+          log("Native WHEP playback established", { streamKey, offerUrl, sessionUrl: playSessionUrl });
+          return;
+        }
+
+        preferSelectedVideoCodec(playPc.addTransceiver("video", { direction: "recvonly" }));
         playPc.addTransceiver("audio", { direction: "recvonly" });
         const offer = await playPc.createOffer();
         await playPc.setLocalDescription(offer);
@@ -588,13 +552,11 @@
           ? `${proxyBase}${response.headers.get("Location")}`
           : null;
         await playPc.setRemoteDescription({ type: "answer", sdp: answerSdp });
-        startPlayStats();
         document.getElementById("playStatus").textContent = `Playing ${streamKey}`;
         log("WHEP playback established", { streamKey, url, sessionUrl: playSessionUrl });
       }
 
       async function stopPlay() {
-        stopPlayStats();
         if (playSessionUrl) {
           await fetch(playSessionUrl, { method: "DELETE" }).catch(() => {});
           playSessionUrl = null;
@@ -610,7 +572,6 @@
         remoteVideo.load();
         playStream = null;
         document.getElementById("playStatus").textContent = "Stopped";
-        document.getElementById("playStats").textContent = "Video statistics will appear during playback.";
       }
 
       document.getElementById("startPublish").addEventListener("click", async () => {

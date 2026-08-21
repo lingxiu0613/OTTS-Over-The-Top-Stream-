@@ -4,6 +4,7 @@
 #include "otts/core/logger.hpp"
 #include "otts/rtmp/stream_registry.hpp"
 #include "otts/webrtc/audio_transcoder.hpp"
+#include "otts/webrtc/shared_video_transcoder.hpp"
 #include "otts/webrtc/video_transcoder.hpp"
 
 #include <algorithm>
@@ -27,6 +28,25 @@
 namespace otts::webrtc {
 
 namespace {
+
+// Keep SDP media candidates on the NIC reachable by remote browser clients.
+// The host has a second 192.168.1.x NIC; advertising it first leaves Chrome
+// connected for audio while RTP video is sent to an unreachable address.
+std::string normalize_sdp_candidates(std::string sdp) {
+    std::stringstream in(sdp);
+    std::string line;
+    std::string out;
+    while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        // libdatachannel emits the obsolete LS grouping attribute; Chromium
+        // rejects the whole session description when it is present.
+        if (line == "a=group:LS video audio") continue;
+        if (line.rfind("a=candidate:", 0) == 0 && line.find("192.168.40.11") == std::string::npos) continue;
+        if (line.rfind("c=IN IP4 ", 0) == 0) line = "c=IN IP4 192.168.40.11";
+        out += line + "\r\n";
+    }
+    return out;
+}
 
 std::string direction_to_string(SessionDirection direction) {
     return direction == SessionDirection::Publish ? "whip" : "whep";
@@ -64,6 +84,16 @@ std::string uppercase_copy(std::string value) {
         ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
     }
     return value;
+}
+
+std::uint32_t session_ssrc(const std::string& session_id, std::uint32_t salt) {
+    std::uint32_t value = 2166136261u ^ salt;
+    for (const auto ch : session_id) {
+        value ^= static_cast<std::uint8_t>(ch);
+        value *= 16777619u;
+    }
+    value ^= salt + 0x9e3779b9u + (value << 6u) + (value >> 2u);
+    return value == 0 ? salt | 1u : value;
 }
 
 WebRtcPayloadTypes parse_offer_payload_types(const std::string& offer_sdp) {
@@ -357,13 +387,23 @@ struct WebRtcService::NativeSession {
     std::shared_ptr<rtc::RtcpSrReporter> audio_sr_reporter;
     std::unique_ptr<AudioTranscoder> opus_to_aac;
     std::unique_ptr<AudioTranscoder> aac_to_opus;
-    std::unique_ptr<VideoTranscoder> hevc_to_avc;
+    std::mutex shared_video_mutex;
+    std::shared_ptr<SharedVideoTranscodePipeline> shared_video_pipeline;
+    SharedVideoTranscodePipeline::SubscriberId shared_video_subscriber_id{0};
     std::vector<std::uint8_t> aac_config;
     bool aac_sequence_published{false};
     bool audio_transcode_error_logged{false};
     std::mutex outbound_mutex;
     std::condition_variable outbound_cv;
-    std::deque<otts::rtmp::MediaMessage> outbound_queue;
+    struct OutboundMedia {
+        otts::rtmp::MediaMessage message;
+        SharedVideoTranscodePipeline::Frame transcoded_video;
+
+        std::uint32_t timestamp() const {
+            return transcoded_video ? transcoded_video->timestamp_ms : message.timestamp;
+        }
+    };
+    std::deque<OutboundMedia> outbound_queue;
     std::thread outbound_thread;
     bool outbound_stop{false};
     bool outbound_started{false};
@@ -505,35 +545,7 @@ struct WebRtcService::NativeSession {
             return;
         }
         if (source_video_codec == otts::media::CodecId::Hevc && video_codec == otts::media::CodecId::Avc) {
-            if (!is_video_keyframe && !video_keyframe_seen.load()) {
-                return;
-            }
-            if (is_video_keyframe) {
-                std::lock_guard<std::mutex> lock(media_mutex);
-                if (!video_config_sample.empty()) {
-                    auto configured = video_config_sample;
-                    configured.insert(configured.end(), sample.begin(), sample.end());
-                    sample = std::move(configured);
-                }
-                video_keyframe_seen.store(true);
-            }
-            if (!hevc_to_avc) {
-                std::string error;
-                hevc_to_avc = VideoTranscoder::create_hevc_to_avc(error);
-                if (!hevc_to_avc) {
-                    otts::core::log_warn("webrtc_native", context + " HEVC-to-AVC init failed: " + error);
-                    return;
-                }
-                otts::core::log_info("webrtc_native", context + " HEVC-to-AVC fallback ready key=" + stream_key);
-            }
-            const auto frames = hevc_to_avc->transcode(sample.data(), sample.size(), message.timestamp);
-            for (const auto& frame : frames) {
-                rtc::FrameInfo info(std::chrono::duration<double, std::milli>(frame.timestamp_ms));
-                info.isKeyFrame = frame.keyframe;
-                video_track->sendFrame(rtc_binary_from_bytes(frame.annexb), info);
-                video_frames.fetch_add(1);
-                video_bytes.fetch_add(frame.annexb.size());
-            }
+            // HEVC-to-AVC frames arrive from the per-stream shared pipeline.
             return;
         }
         if (!is_video_keyframe && !video_keyframe_seen.load()) {
@@ -570,6 +582,77 @@ struct WebRtcService::NativeSession {
         }
     }
 
+    void send_shared_video_to_webrtc(
+        const SharedVideoTranscodePipeline::Frame& frame,
+        const std::string& context) {
+        if (!frame || !video_track) return;
+        rtc::FrameInfo info(std::chrono::duration<double, std::milli>(frame->timestamp_ms));
+        info.isKeyFrame = frame->keyframe;
+        try {
+            if (frame->keyframe) {
+                const auto sets = otts::codec::extract_parameter_sets(
+                    frame->annexb, otts::media::CodecId::Avc);
+                if (sets.complete(otts::media::CodecId::Avc)) {
+                    rtc::FrameInfo config_info(std::chrono::duration<double, std::milli>(frame->timestamp_ms));
+                    config_info.isKeyFrame = false;
+                    video_track->sendFrame(rtc_binary_from_bytes(sets.annexb()), config_info);
+                }
+            }
+            video_track->sendFrame(rtc_binary_from_bytes(frame->annexb), info);
+            video_frames.fetch_add(1);
+            video_bytes.fetch_add(frame->annexb.size());
+        } catch (const std::exception& exc) {
+            const std::string error = exc.what();
+            otts::core::log_warn("webrtc_native", context + " shared video sendFrame failed: " + error);
+            if (error.find("closed") != std::string::npos) detach_play_subscription();
+        }
+    }
+
+    bool uses_shared_video_transcode() const {
+        return source_video_codec == otts::media::CodecId::Hevc &&
+               video_codec == otts::media::CodecId::Avc;
+    }
+
+    bool attach_shared_video_transcode(
+        const std::weak_ptr<NativeSession>& weak,
+        const std::string& context) {
+        if (!uses_shared_video_transcode() || registry == nullptr) return true;
+        // A Track can report open from inside the PeerConnection state callback
+        // just before DTLS/SRTP is ready to carry the first large fragmented
+        // IDR. Let that callback settle before acquiring and replaying a shared
+        // pipeline, avoiding both packet loss and a throwaway pipeline.
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        if (!open.load()) return false;
+        std::string error;
+        auto pipeline = acquire_shared_hevc_to_avc_pipeline(
+            *registry, stream_key, VideoTranscodeSettings{}, error);
+        if (!pipeline) {
+            otts::core::log_warn(
+                "webrtc_native", context + " shared HEVC-to-AVC acquire failed key=" +
+                    stream_key + " error=" + error);
+            return false;
+        }
+        const auto subscriber_id = pipeline->subscribe([weak](SharedVideoTranscodePipeline::Frame frame) {
+            if (auto session = weak.lock()) session->enqueue_transcoded_video(std::move(frame));
+        });
+        if (subscriber_id == 0) return false;
+        std::lock_guard<std::mutex> lock(shared_video_mutex);
+        shared_video_pipeline = std::move(pipeline);
+        shared_video_subscriber_id = subscriber_id;
+        return true;
+    }
+
+    void detach_shared_video_transcode() {
+        std::shared_ptr<SharedVideoTranscodePipeline> pipeline;
+        SharedVideoTranscodePipeline::SubscriberId subscriber_id = 0;
+        {
+            std::lock_guard<std::mutex> lock(shared_video_mutex);
+            pipeline = std::move(shared_video_pipeline);
+            subscriber_id = std::exchange(shared_video_subscriber_id, 0);
+        }
+        if (pipeline && subscriber_id != 0) pipeline->unsubscribe(subscriber_id);
+    }
+
     void start_play_sender(const std::string& context) {
         std::lock_guard<std::mutex> lock(outbound_mutex);
         if (outbound_started) {
@@ -582,32 +665,33 @@ struct WebRtcService::NativeSession {
             std::uint32_t media_origin = 0;
             auto wall_origin = std::chrono::steady_clock::now();
             while (true) {
-                otts::rtmp::MediaMessage message;
+                OutboundMedia outbound;
                 {
                     std::unique_lock<std::mutex> lock(outbound_mutex);
                     outbound_cv.wait(lock, [&]() { return outbound_stop || !outbound_queue.empty(); });
                     if (outbound_stop && outbound_queue.empty()) {
                         break;
                     }
-                    message = std::move(outbound_queue.front());
+                    outbound = std::move(outbound_queue.front());
                     outbound_queue.pop_front();
                 }
 
                 const auto now = std::chrono::steady_clock::now();
+                const auto timestamp = outbound.timestamp();
                 if (!clock_started) {
-                    media_origin = message.timestamp;
+                    media_origin = timestamp;
                     wall_origin = now;
                     clock_started = true;
                 }
-                auto delta_ms = static_cast<std::uint32_t>(message.timestamp - media_origin);
+                auto delta_ms = static_cast<std::uint32_t>(timestamp - media_origin);
                 if (delta_ms > 600000) {
-                    media_origin = message.timestamp;
+                    media_origin = timestamp;
                     wall_origin = now;
                     delta_ms = 0;
                 }
                 auto target = wall_origin + std::chrono::milliseconds(delta_ms);
                 if (target > now + std::chrono::milliseconds(500)) {
-                    media_origin = message.timestamp;
+                    media_origin = timestamp;
                     wall_origin = now;
                     delta_ms = 0;
                     target = now;
@@ -623,10 +707,12 @@ struct WebRtcService::NativeSession {
                         break;
                     }
                 }
-                if (message.type_id == 8) {
-                    send_audio_to_webrtc(message, context);
-                } else if (message.type_id == 9) {
-                    send_video_to_webrtc(message, context);
+                if (outbound.transcoded_video) {
+                    send_shared_video_to_webrtc(outbound.transcoded_video, context);
+                } else if (outbound.message.type_id == 8) {
+                    send_audio_to_webrtc(outbound.message, context);
+                } else if (outbound.message.type_id == 9) {
+                    send_video_to_webrtc(outbound.message, context);
                 }
             }
         });
@@ -656,8 +742,8 @@ struct WebRtcService::NativeSession {
 
         if (outbound_waiting_for_keyframe && message.type_id == 9) {
             const auto packet = otts::codec::parse_flv_video_packet(message.payload);
-            const bool sequence_header = packet && packet->sequence_header && packet->codec == video_codec;
-            const bool keyframe = packet && packet->coded_frames && packet->keyframe && packet->codec == video_codec;
+            const bool sequence_header = packet && packet->sequence_header && packet->codec == source_video_codec;
+            const bool keyframe = packet && packet->coded_frames && packet->keyframe && packet->codec == source_video_codec;
             if (!sequence_header && !keyframe) {
                 return;
             }
@@ -665,7 +751,34 @@ struct WebRtcService::NativeSession {
                 outbound_waiting_for_keyframe = false;
             }
         }
-        outbound_queue.push_back(message);
+        OutboundMedia outbound;
+        outbound.message = message;
+        outbound_queue.push_back(std::move(outbound));
+        outbound_cv.notify_one();
+    }
+
+    void enqueue_transcoded_video(SharedVideoTranscodePipeline::Frame frame) {
+        if (!frame) return;
+        std::lock_guard<std::mutex> lock(outbound_mutex);
+        if (outbound_stop) return;
+        if (outbound_queue.size() >= 1024) {
+            outbound_queue.clear();
+            outbound_waiting_for_keyframe = true;
+            video_keyframe_seen.store(false);
+            ++outbound_overflows;
+            otts::core::log_warn(
+                "webrtc_native",
+                "WHEP shared-frame queue overflow; waiting for next H.264 keyframe key=" + stream_key +
+                    " count=" + std::to_string(outbound_overflows));
+        }
+        if (outbound_waiting_for_keyframe && !frame->keyframe) return;
+        if (frame->keyframe) {
+            outbound_waiting_for_keyframe = false;
+            video_keyframe_seen.store(true);
+        }
+        OutboundMedia outbound;
+        outbound.transcoded_video = std::move(frame);
+        outbound_queue.push_back(std::move(outbound));
         outbound_cv.notify_one();
     }
 
@@ -683,6 +796,7 @@ struct WebRtcService::NativeSession {
     }
 #endif
     void detach_play_subscription() {
+        detach_shared_video_transcode();
         if (registry != nullptr && callback_id != 0 && direction == SessionDirection::Play) {
             registry->remove_callback_subscriber(stream_key, callback_id);
             registry->update_external_viewers(stream_key, otts::media::StreamSource::Whip, "cpp-webrtc-native", 0);
@@ -1009,9 +1123,22 @@ NativeOfferResult WebRtcService::create_native_play_offer(const std::string& str
     session->direction = SessionDirection::Play;
     session->registry = registry;
     session->started_at_epoch_ms = now_epoch_ms();
+    // Native-offer always advertises H.264. Detect an HEVC source up front so
+    // the shared HEVC decoder/H.264 encoder is attached before raw H.265 packets
+    // reach the H.264 RTP packetizer.
+    for (const auto& snapshot : registry->snapshots()) {
+        if (snapshot.stream_key == stream_key && snapshot.video_codec == "h265") {
+            session->source_video_codec = otts::media::CodecId::Hevc;
+            break;
+        }
+    }
 
     rtc::Configuration config;
     config.disableAutoNegotiation = true;
+    // Advertise the server NIC reachable by browser clients.  Auto-gathering
+    // selected the unrelated 192.168.1.x interface, making ICE succeed only
+    // locally while remote browsers stayed in a spinner.
+    config.bindAddress = "192.168.40.11";
     auto pc = std::make_shared<rtc::PeerConnection>(config);
     session->pc = pc;
 
@@ -1049,7 +1176,7 @@ NativeOfferResult WebRtcService::create_native_play_offer(const std::string& str
     auto attach_play_callback = std::make_shared<std::function<void()>>();
     *attach_play_callback = [weak = std::weak_ptr<NativeSession>(session), registry]() {
         auto locked = weak.lock();
-        if (!locked || !locked->video_track_open.load() || !locked->audio_track_open.load()) {
+        if (!locked || !locked->open.load() || !locked->video_track || !locked->audio_track) {
             return;
         }
         bool expected = false;
@@ -1058,10 +1185,17 @@ NativeOfferResult WebRtcService::create_native_play_offer(const std::string& str
         }
         const auto callback_id = static_cast<otts::rtmp::StreamRegistry::CallbackId>(now_epoch_ms());
         locked->callback_id = callback_id;
-        registry->update_external_viewers(locked->stream_key, otts::media::StreamSource::Whip, "cpp-webrtc-native", 1);
         locked->start_play_sender("native-offer WHEP");
+        if (!locked->attach_shared_video_transcode(weak, "native-offer WHEP")) {
+            locked->stop_play_sender();
+            locked->callback_id = 0;
+            locked->play_callback_registered.store(false);
+            return;
+        }
+        registry->update_external_viewers(locked->stream_key, otts::media::StreamSource::Whip, "cpp-webrtc-native", 1);
         registry->add_callback_subscriber(locked->stream_key, callback_id, [weak](const otts::rtmp::MediaMessage& message) {
             if (auto locked = weak.lock()) {
+                if (message.type_id == 9 && locked->uses_shared_video_transcode()) return;
                 locked->enqueue_play_media(message);
             }
         });
@@ -1070,8 +1204,8 @@ NativeOfferResult WebRtcService::create_native_play_offer(const std::string& str
 
     constexpr std::uint8_t video_payload_type = 102;
     constexpr std::uint8_t audio_payload_type = 111;
-    constexpr rtc::SSRC video_ssrc = 0x51545331;
-    constexpr rtc::SSRC audio_ssrc = 0x51545332;
+    const rtc::SSRC video_ssrc = session_ssrc(session->session_id, 0x51545331u);
+    const rtc::SSRC audio_ssrc = session_ssrc(session->session_id, 0x51545332u);
     rtc::Description::Video video("video", rtc::Description::Direction::SendOnly);
     video.addH264Codec(video_payload_type);
     video.addSSRC(video_ssrc, "otts-video", "otts-stream", "otts-video");
@@ -1169,12 +1303,12 @@ NativeOfferResult WebRtcService::create_native_play_offer(const std::string& str
         {
             std::lock_guard<std::mutex> lock(mutex_);
             auto& stored = sessions_[session->session_id];
-            stored.offer_sdp = local_sdp;
+            stored.offer_sdp = normalize_sdp_candidates(local_sdp);
             stored.updated_at_epoch_ms = now_epoch_ms();
         }
         result.ok = true;
         result.session_id = session->session_id;
-        result.answer_sdp = local_sdp;
+        result.answer_sdp = normalize_sdp_candidates(local_sdp);
         return result;
     } catch (const std::exception& exc) {
         result.error = exc.what();
@@ -1243,9 +1377,22 @@ NativeOfferResult WebRtcService::handle_native_offer_locked(
     session->direction = direction;
     session->registry = registry;
     session->started_at_epoch_ms = now_epoch_ms();
+    // Native-offer always advertises H.264. Detect an HEVC source up front so
+    // the shared HEVC decoder/H.264 encoder is attached before raw H.265 packets
+    // reach the H.264 RTP packetizer.
+    for (const auto& snapshot : registry->snapshots()) {
+        if (snapshot.stream_key == stream_key && snapshot.video_codec == "h265") {
+            session->source_video_codec = otts::media::CodecId::Hevc;
+            break;
+        }
+    }
 
     rtc::Configuration config;
     config.disableAutoNegotiation = true;
+    // Advertise the server NIC reachable by browser clients.  Auto-gathering
+    // selected the unrelated 192.168.1.x interface, making ICE succeed only
+    // locally while remote browsers stayed in a spinner.
+    config.bindAddress = "192.168.40.11";
     auto pc = std::make_shared<rtc::PeerConnection>(config);
     session->pc = pc;
 
@@ -1306,8 +1453,8 @@ NativeOfferResult WebRtcService::handle_native_offer_locked(
             const auto video_payload_type = wire_codec == otts::media::CodecId::Hevc
                 ? negotiated_payload_types.h265 : negotiated_payload_types.h264;
             const auto audio_payload_type = negotiated_payload_types.opus;
-            constexpr rtc::SSRC video_ssrc = 0x51545331;
-            constexpr rtc::SSRC audio_ssrc = 0x51545332;
+            const rtc::SSRC video_ssrc = session_ssrc(session->session_id, 0x51545331u);
+            const rtc::SSRC audio_ssrc = session_ssrc(session->session_id, 0x51545332u);
             otts::core::log_info(
                 "webrtc_native",
                 "WHEP negotiated payload types key=" + stream_key +
@@ -1328,10 +1475,17 @@ NativeOfferResult WebRtcService::handle_native_offer_locked(
                 }
                 const auto callback_id = static_cast<otts::rtmp::StreamRegistry::CallbackId>(now_epoch_ms());
                 locked->callback_id = callback_id;
-                registry->update_external_viewers(locked->stream_key, otts::media::StreamSource::Whip, "cpp-webrtc-native", 1);
                 locked->start_play_sender("WHEP");
+                if (!locked->attach_shared_video_transcode(weak, "WHEP")) {
+                    locked->stop_play_sender();
+                    locked->callback_id = 0;
+                    locked->play_callback_registered.store(false);
+                    return;
+                }
+                registry->update_external_viewers(locked->stream_key, otts::media::StreamSource::Whip, "cpp-webrtc-native", 1);
                 registry->add_callback_subscriber(locked->stream_key, callback_id, [weak](const otts::rtmp::MediaMessage& message) {
                     if (auto locked = weak.lock()) {
+                        if (message.type_id == 9 && locked->uses_shared_video_transcode()) return;
                         locked->enqueue_play_media(message);
                     }
                 });
@@ -1563,13 +1717,13 @@ NativeOfferResult WebRtcService::handle_native_offer_locked(
         {
             std::lock_guard<std::mutex> lock(mutex_);
             auto& stored = sessions_[session->session_id];
-            stored.answer_sdp = local_sdp;
+            stored.answer_sdp = normalize_sdp_candidates(local_sdp);
             stored.updated_at_epoch_ms = now_epoch_ms();
         }
 
         result.ok = true;
         result.session_id = session->session_id;
-        result.answer_sdp = local_sdp;
+        result.answer_sdp = normalize_sdp_candidates(local_sdp);
         return result;
     } catch (const std::exception& exc) {
         result.error = exc.what();

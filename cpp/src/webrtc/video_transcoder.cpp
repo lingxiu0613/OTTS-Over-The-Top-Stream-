@@ -7,6 +7,7 @@ extern "C" {
 }
 
 #include <array>
+#include <sstream>
 
 namespace otts::webrtc {
 namespace {
@@ -23,6 +24,7 @@ struct VideoTranscoder::Impl {
     AVCodecContext* decoder{nullptr};
     AVCodecContext* encoder{nullptr};
     std::string last_error;
+    VideoTranscodeSettings settings;
 
     ~Impl() {
         avcodec_free_context(&decoder);
@@ -47,7 +49,7 @@ struct VideoTranscoder::Impl {
 
     bool ensure_encoder(const AVFrame* input) {
         if (encoder) return true;
-        const auto* codec = avcodec_find_encoder_by_name("libx264");
+        const auto* codec = avcodec_find_encoder_by_name(settings.encoder_name.c_str());
         if (!codec) codec = avcodec_find_encoder(AV_CODEC_ID_H264);
         encoder = codec ? avcodec_alloc_context3(codec) : nullptr;
         if (!encoder) {
@@ -58,13 +60,15 @@ struct VideoTranscoder::Impl {
         encoder->height = input->height;
         encoder->pix_fmt = static_cast<AVPixelFormat>(input->format);
         encoder->time_base = AVRational{1, 1000};
-        encoder->framerate = AVRational{30, 1};
-        encoder->bit_rate = 2500000;
-        encoder->gop_size = 60;
+        encoder->framerate = AVRational{static_cast<int>(settings.frame_rate), 1};
+        encoder->bit_rate = settings.bit_rate;
+        encoder->gop_size = static_cast<int>(settings.gop_size);
         encoder->max_b_frames = 0;
-        av_opt_set(encoder->priv_data, "preset", "ultrafast", 0);
-        av_opt_set(encoder->priv_data, "tune", "zerolatency", 0);
-        av_opt_set(encoder->priv_data, "x264-params", "repeat-headers=1:annexb=1:keyint=60", 0);
+        av_opt_set(encoder->priv_data, "preset", settings.preset.c_str(), 0);
+        av_opt_set(encoder->priv_data, "tune", settings.tune.c_str(), 0);
+        const auto x264_params =
+            "repeat-headers=1:annexb=1:keyint=" + std::to_string(settings.gop_size);
+        av_opt_set(encoder->priv_data, "x264-params", x264_params.c_str(), 0);
         const auto result = avcodec_open2(encoder, codec, nullptr);
         if (result < 0) {
             last_error = "H.264 encoder open failed: " + ffmpeg_error(result);
@@ -122,8 +126,22 @@ struct VideoTranscoder::Impl {
 VideoTranscoder::VideoTranscoder(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 VideoTranscoder::~VideoTranscoder() = default;
 
+std::string VideoTranscodeSettings::cache_key() const {
+    std::ostringstream out;
+    out << encoder_name << ':' << bit_rate << ':' << frame_rate << ':' << gop_size
+        << ':' << preset << ':' << tune;
+    return out.str();
+}
+
 std::unique_ptr<VideoTranscoder> VideoTranscoder::create_hevc_to_avc(std::string& error) {
+    return create_hevc_to_avc(VideoTranscodeSettings{}, error);
+}
+
+std::unique_ptr<VideoTranscoder> VideoTranscoder::create_hevc_to_avc(
+    const VideoTranscodeSettings& settings,
+    std::string& error) {
     auto impl = std::make_unique<Impl>();
+    impl->settings = settings;
     if (!impl->open_decoder()) {
         error = impl->last_error;
         return nullptr;

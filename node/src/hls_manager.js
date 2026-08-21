@@ -72,7 +72,7 @@ function isStreamReadyForHls(stream) {
   if (stream.ready_for_play === false) {
     return false;
   }
-  return Boolean(stream.has_video_sequence_header || ["h264", "h265"].includes(stream.video_codec));
+  return Boolean(stream.has_video_sequence_header || stream.video_codec === "h264");
 }
 
 export class HlsManager {
@@ -202,23 +202,17 @@ export class HlsManager {
       last_exit_code: proc?.lastExitCode ?? null,
       last_error: proc?.lastError || null,
       restart_count: proc?.restartCount ?? 0,
-      publish_generation: proc?.publishGeneration ?? null,
-      video_codec: proc?.videoCodec || null,
-      segment_type: proc?.segmentType || null,
-      init_segment_path: proc?.segmentType === "fmp4" ? this.segmentPath(streamKey, "init.mp4") : null,
-      init_segment_exists: proc?.segmentType === "fmp4" ? fs.existsSync(this.segmentPath(streamKey, "init.mp4")) : false,
       auto_start: this.autoStart,
       playlist_startup_timeout_ms: this.playlistStartupTimeoutMs
     };
   }
 
-  async writeMasterPlaylist(streamKey, videoCodec = "h264") {
+  async writeMasterPlaylist(streamKey) {
     await fsp.mkdir(streamDir(this.rootDir, streamKey), { recursive: true });
-    const codecTag = videoCodec === "h265" ? "hvc1.1.6.L120.B0" : "avc1.64001f";
     const content = [
       "#EXTM3U",
-      videoCodec === "h265" ? "#EXT-X-VERSION:7" : "#EXT-X-VERSION:3",
-      `#EXT-X-STREAM-INF:BANDWIDTH=2500000,CODECS="${codecTag},mp4a.40.2"`,
+      "#EXT-X-VERSION:3",
+      '#EXT-X-STREAM-INF:BANDWIDTH=2500000,CODECS="avc1.64001f,mp4a.40.2"',
       "index.m3u8",
       ""
     ].join("\n");
@@ -262,22 +256,27 @@ export class HlsManager {
     await fsp.mkdir(outputDir, { recursive: true });
 
     const playlistPath = path.join(outputDir, "index.m3u8");
-    const videoCodec = streamState?.video_codec === "h265" ? "h265" : "h264";
-    const segmentType = videoCodec === "h265" ? "fmp4" : "mpegts";
-    const segmentPattern = path.join(outputDir, videoCodec === "h265" ? "seg_%05d.m4s" : "seg_%05d.ts");
+    const segmentPattern = path.join(outputDir, "seg_%05d.ts");
     const logPath = path.join(outputDir, "ffmpeg.log");
     const logStream = fs.createWriteStream(logPath, { flags: "a" });
     const inputUrl = buildRtmpUrl(this.rtmpBase, streamKey, "play");
+    const needsVideoTranscode = streamState?.video_codec === "h265" || streamState?.video_codec === "hevc";
+    const videoArgs = needsVideoTranscode
+      ? ["-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-g", "60"]
+      : ["-c:v", "copy"];
 
-    const hlsArgs = [
+    const child = spawn(
+      this.ffmpegBin,
+      [
         "-hide_banner",
         "-loglevel",
         "warning",
         "-y",
         "-i",
         inputUrl,
-        "-c",
-        "copy",
+        ...videoArgs,
+        "-c:a",
+        "aac",
         "-f",
         "hls",
         "-hls_time",
@@ -288,18 +287,10 @@ export class HlsManager {
         "2",
         "-hls_flags",
         "delete_segments+append_list+omit_endlist+program_date_time+independent_segments+temp_file",
-    ];
-    if (segmentType === "fmp4") {
-      hlsArgs.push("-hls_segment_type", "fmp4", "-hls_fmp4_init_filename", "init.mp4");
-    }
-    hlsArgs.push(
         "-hls_segment_filename",
         segmentPattern,
         playlistPath
-    );
-    const child = spawn(
-      this.ffmpegBin,
-      hlsArgs,
+      ],
       {
         stdio: ["ignore", "pipe", "pipe"]
       }
@@ -316,9 +307,6 @@ export class HlsManager {
       lastExitCode: null,
       lastError: null,
       restartCount: existing?.restartCount || 0,
-      publishGeneration: streamState?.publish_generation ?? 0,
-      videoCodec,
-      segmentType,
       logStream
     };
 
@@ -340,7 +328,7 @@ export class HlsManager {
     });
 
     this.processes.set(streamKey, state);
-    await this.writeMasterPlaylist(streamKey, videoCodec);
+    await this.writeMasterPlaylist(streamKey);
     return this.getStatus(streamKey);
   }
 
@@ -394,11 +382,6 @@ export class HlsManager {
       }
       liveKeys.add(stream.stream_key);
       const existing = this.processes.get(stream.stream_key);
-      if (existing && !existing.exited && existing.publishGeneration !== (stream.publish_generation ?? 0)) {
-        existing.child.kill("SIGTERM");
-        existing.exited = true;
-        existing.restartCount = (existing.restartCount || 0) + 1;
-      }
       if (this.autoStart && isStreamReadyForHls(stream) && (!existing || existing.exited)) {
         if (existing?.exited) {
           existing.restartCount = (existing.restartCount || 0) + 1;

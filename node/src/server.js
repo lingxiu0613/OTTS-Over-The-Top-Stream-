@@ -1,5 +1,4 @@
 import express from "express";
-import { spawnSync } from "child_process";
 import fs from "fs/promises";
 import http from "http";
 import https from "https";
@@ -205,10 +204,13 @@ function nativeRtspUrls(streamKey) {
   };
 }
 
-function nativeSrtUrls() {
+function nativeSrtUrls(streamKey = "live/srt-demo") {
+  // The native C++ listener uses the configured stream key directly. Keep the
+  // stream id in the simple SRT form accepted by ffplay/FFmpeg on Windows.
+  const streamId = streamKey;
   return {
-    publish_url: `srt://${process.env.OTTS_SRT_PUBLIC_HOST || process.env.OTTS_RTSP_PUBLIC_HOST || "192.168.40.11"}:${Number(process.env.OTTS_SRT_PUBLISH_PORT_BASE || 9000)}?mode=caller&transtype=live`,
-    play_url: `srt://${process.env.OTTS_SRT_PUBLIC_HOST || process.env.OTTS_RTSP_PUBLIC_HOST || "192.168.40.11"}:${Number(process.env.OTTS_SRT_PLAY_PORT_BASE || 10000)}?mode=caller&transtype=live`
+    publish_url: `srt://${process.env.OTTS_SRT_PUBLIC_HOST || process.env.OTTS_RTSP_PUBLIC_HOST || "192.168.40.11"}:${Number(process.env.OTTS_SRT_PUBLISH_PORT_BASE || 9000)}?mode=caller&transtype=live&streamid=${streamId}`,
+    play_url: `srt://${process.env.OTTS_SRT_PUBLIC_HOST || process.env.OTTS_RTSP_PUBLIC_HOST || "192.168.40.11"}:${Number(process.env.OTTS_SRT_PLAY_PORT_BASE || 10000)}?mode=caller&transtype=live&streamid=${streamId}`
   };
 }
 
@@ -600,7 +602,15 @@ app.use((req, _res, next) => {
   req.on("error", next);
 });
 app.use(express.json());
-app.use(express.static(path.join(__dirname, "..", "web")));
+app.use(express.static(path.join(__dirname, "..", "web"), {
+  // The console is an operational control surface; never let a browser keep
+  // an old HTML shell after a deployment. Static media can still be cached.
+  setHeaders(res, filePath) {
+    if (filePath.endsWith(".html")) {
+      res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+    }
+  }
+}));
 app.use("/recordings", (req, res, next) => {
   express.static(recordingManager.rootDir)(req, res, next);
 });
@@ -882,11 +892,12 @@ app.get("/api/rtsp/compat", async (_req, res) => {
 });
 
 app.get("/api/srt/sessions", async (_req, res) => {
+  const streamKey = String(_req.query.stream_key || "live/srt-demo");
   const sessions = nativeProtocolOnly ? [] : srtManager.listStatuses();
   const protocolSessions = await getProtocolSessions();
   const nativeSessions = (protocolSessions.sessions || [])
     .filter((session) => session.source_protocol === "srt" && String(session.managed_by || "").startsWith("cpp-srt-"));
-  const nativeUrls = nativeSrtUrls();
+  const nativeUrls = nativeSrtUrls(streamKey);
   res.json({
     native_only: nativeProtocolOnly,
     disabled: nativeProtocolOnly,
@@ -906,15 +917,15 @@ app.get("/api/srt/sessions", async (_req, res) => {
 });
 
 app.post("/api/srt/start", async (req, res) => {
+  const streamKey = String(req.query.stream_key || "");
   if (nativeProtocolOnly) {
     res.status(410).json({
       ok: false,
       error: "SRT ffmpeg compatibility workers are disabled; use the native C++ SRT publish/play ports directly",
-      urls: nativeSrtUrls()
+      urls: nativeSrtUrls(streamKey)
     });
     return;
   }
-  const streamKey = String(req.query.stream_key || "");
   const mode = String(req.query.mode || "both");
   if (!streamKey) {
     res.status(400).json({ ok: false, error: "missing stream_key" });
@@ -1218,24 +1229,6 @@ if (!nativeProtocolOnly && rtspPlaybackEnabled) {
 
 if (tlsKeyPath && tlsCertPath) {
   try {
-    try {
-      await Promise.all([fs.access(tlsKeyPath), fs.access(tlsCertPath)]);
-    } catch {
-      await fs.mkdir(path.dirname(tlsKeyPath), { recursive: true });
-      await fs.mkdir(path.dirname(tlsCertPath), { recursive: true });
-      const result = spawnSync("openssl", [
-        "req", "-x509", "-newkey", "rsa:2048", "-nodes",
-        "-keyout", tlsKeyPath,
-        "-out", tlsCertPath,
-        "-days", "3650",
-        "-subj", "/CN=OTTS Development"
-      ], { encoding: "utf8" });
-      if (result.status !== 0) {
-        throw new Error(`failed to generate development TLS certificate: ${result.stderr || "openssl failed"}`);
-      }
-      await fs.chmod(tlsKeyPath, 0o600);
-      console.log("OTTS generated a local self-signed HTTPS certificate.");
-    }
     const [key, cert] = await Promise.all([
       fs.readFile(tlsKeyPath),
       fs.readFile(tlsCertPath)
