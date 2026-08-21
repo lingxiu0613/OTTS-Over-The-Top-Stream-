@@ -35,10 +35,10 @@ copy_path python
 copy_path scripts
 copy_path docs
 copy_path README.md
-copy_path restart_otts.sh
-copy_path stop_otts.sh
-copy_path status_otts.sh
-copy_path smoke_rtmp.sh
+copy_path scripts/restart_otts.sh restart_otts.sh
+copy_path scripts/stop_otts.sh stop_otts.sh
+copy_path scripts/status_otts.sh status_otts.sh
+copy_path scripts/smoke_rtmp.sh smoke_rtmp.sh
 
 mkdir -p "${PACKAGE_DIR}/config"
 if [[ -f config/otts.env.example ]]; then
@@ -60,6 +60,9 @@ sudo apt update
 sudo apt install -y \
   ffmpeg curl openssl net-tools iproute2 psmisc nodejs npm \
   libssl3 libsrt1.5-openssl libnice10 libsrtp2-1 libusrsctp2
+
+cd "$(dirname "$0")/node"
+npm install --omit=dev
 EOF
 
 cat > "${PACKAGE_DIR}/RUNNING.md" <<'EOF'
